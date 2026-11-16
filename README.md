@@ -136,6 +136,10 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 
 This removes the scripts, the shortcut, the thumbnail cache and the auto-rotate timer. Your wallpapers, favourites and settings are kept.
 
+## How it was made
+
+hilm was designed, directed and tested by me, with the code written using [Claude Code](https://claude.com/claude-code) (Anthropic) as an AI coding assistant.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) or the [releases](https://github.com/Dagmawi-M/omarchy-hilm/releases).
