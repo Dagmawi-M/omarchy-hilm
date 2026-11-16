@@ -11,7 +11,7 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 REPO="https://github.com/Dagmawi-M/omarchy-hilm"
 BIN="$HOME/.local/bin"
 SHARE="$HOME/.local/share/omarchy-hilm"

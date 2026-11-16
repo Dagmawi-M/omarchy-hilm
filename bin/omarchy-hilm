@@ -7,7 +7,9 @@ wallpaper, tinted with the current omarchy theme accent.
 Shows your own collection plus every Omarchy theme's backgrounds.
 
 Keys:  ←/→ h/l, scroll   navigate        Enter/Space  apply
-       Tab / Shift+Tab   switch source (all · collection · theme · all themes)
+       Tab / Shift+Tab   switch source (all · collection · theme · all themes · web)
+       u                 undo last change    w   search wallhaven.cc (SFW) and download
+CLI:   omarchy-hilm undo
        /  then type      search          f            favourite
        r                 random spin     t            toggle auto-rotate
        Del/x (twice)     hide (file is kept)          o            import from file
@@ -96,7 +98,7 @@ RADIUS = 14
 SPACING = 300
 FONT = "JetBrainsMono Nerd Font"
 IMPORT = object()
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 # ---------------------------------------------------------------- helpers
@@ -231,6 +233,128 @@ def scan_pool():
     return [p for p, _, _ in scan_sources()]
 
 
+# ---------------------------------------------------------------- undo history
+HISTORY = CONF_DIR / "history"      # one JSON object per line, newest last
+
+
+def snapshot():
+    """What's on screen right now: background file, theme name, playing video."""
+    return {"bg": current_path(), "theme": current_theme_name(), "video": active_video()}
+
+
+def push_history(state):
+    if not state.get("bg"):
+        return
+    HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = HISTORY.read_text().splitlines()
+    except OSError:
+        lines = []
+    lines = (lines + [json.dumps(state)])[-20:]
+    HISTORY.write_text("\n".join(lines) + "\n")
+
+
+def pop_history():
+    try:
+        lines = [l for l in HISTORY.read_text().splitlines() if l.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    HISTORY.write_text("\n".join(lines[:-1]) + ("\n" if lines[:-1] else ""))
+    try:
+        return json.loads(lines[-1])
+    except ValueError:
+        return None
+
+
+def restore_script(state):
+    """Shell command that puts back a snapshot: the exact theme and wallpaper."""
+    bg, theme, video = state.get("bg") or "", state.get("theme") or "", state.get("video")
+    q = shlex.quote
+    if not bg or not os.path.exists(bg):
+        return None
+    if theme in GENERATED_THEMES or not theme:
+        # it was a hilm-generated theme: regenerate it from that wallpaper
+        src = bg
+        if is_video(Path(bg)):
+            src = (build_cache(Path(bg))[1] or {}).get("frame") or bg
+        cmd = f"{THEME_CMD} {q(src)}"
+    else:
+        cmd = f"omarchy-theme-set {q(theme)}"
+    if OMARCHY4:
+        cmd += f"; omarchy-theme-bg-set {q(bg)}"
+    elif video and shutil.which("mpvpaper"):
+        cmd += (f"; pkill -x swaybg; pkill -x mpvpaper; echo {q(video)} > {q(str(ACTIVE_VIDEO))}; "
+                f"setsid {mpv_cmd(video)} >/dev/null 2>&1 &")
+    else:
+        cmd = f"pkill -x mpvpaper; rm -f {q(str(ACTIVE_VIDEO))}; " + cmd + f"; {THEME_CMD} --wallpaper-only {q(bg)}"
+    return cmd
+
+
+# ---------------------------------------------------------------- web search
+# Wallhaven's public API. purity=100 asks for SFW results only; no account or
+# API key is used, and only the search words are sent.
+WEB_DIR = CACHE / "web"
+WEB_API = "https://wallhaven.cc/api/v1/search"
+WEB_UA = {"User-Agent": "omarchy-hilm"}
+
+
+def web_search(query, limit=24):
+    """Returns [(thumb_path, meta)] with thumbnails downloaded locally."""
+    import urllib.parse
+    import urllib.request
+    url = WEB_API + "?" + urllib.parse.urlencode(
+        {"q": query, "categories": "110", "purity": "100", "sorting": "relevance",
+         "atleast": "1920x1080"})
+    req = urllib.request.Request(url, headers=WEB_UA)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode())
+    WEB_DIR.mkdir(parents=True, exist_ok=True)
+    jobs = []
+    for w in data.get("data", [])[:limit]:
+        if w.get("purity") != "sfw":
+            continue
+        thumb_url = (w.get("thumbs") or {}).get("large")
+        full_url = w.get("path")
+        if not thumb_url or not full_url or not full_url.startswith("https://"):
+            continue
+        tp = WEB_DIR / f"wallhaven-{w['id']}{Path(thumb_url).suffix or '.jpg'}"
+        jobs.append((tp, thumb_url, {"id": w["id"], "url": full_url, "res": w.get("resolution", "")}))
+
+    def fetch(job):
+        tp, thumb_url, meta = job
+        if not tp.exists():
+            try:
+                with urllib.request.urlopen(urllib.request.Request(thumb_url, headers=WEB_UA),
+                                            timeout=15) as r:
+                    data = r.read()
+                tmp = tp.with_suffix(tp.suffix + ".part")
+                tmp.write_bytes(data)
+                os.replace(tmp, tp)
+            except OSError:
+                return None
+        return tp, meta
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return [r for r in pool.map(fetch, jobs) if r]
+
+
+def web_download(meta, dest_dir):
+    """Download the full-size image into dest_dir (never overwrites). Returns its path."""
+    import urllib.request
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"wallhaven-{meta['id']}{Path(meta['url']).suffix}"
+    if dest.exists():
+        return dest
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with urllib.request.urlopen(urllib.request.Request(meta["url"], headers=WEB_UA), timeout=60) as r:
+        tmp.write_bytes(r.read())
+    os.replace(tmp, dest)
+    return dest
+
+
 def cache_key(path):
     st = path.stat()
     return hashlib.sha1(f"{path}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:16]
@@ -292,10 +416,12 @@ def build_cache(path):
     thumb = sc.new_subpixbuf((nw - CARD_W) // 2, (nh - CARD_H) // 2, CARD_W, CARD_H).copy()
     meta = {"res": res, "palette": palette_of(src),
             "frame": str(src_file) if is_video(path) else None}
-    tmp = tp.with_suffix(f".{os.getpid()}.tmp")
+    import threading
+    uniq = f"{os.getpid()}-{threading.get_ident()}"      # per thread: never share a temp file
+    tmp = tp.with_suffix(f".{uniq}.tmp")
     thumb.savev(str(tmp), "png", [], [])
     os.replace(tmp, tp)
-    mtmp = mp.with_suffix(f".{os.getpid()}.tmp")
+    mtmp = mp.with_suffix(f".{uniq}.tmp")
     mtmp.write_text(json.dumps(meta))
     os.replace(mtmp, mp)
     return thumb, meta
@@ -377,6 +503,10 @@ class Picker:
         self.search = None          # None = not searching, str = query
         self.toast = ("", 0.0)
         self.favs = load_favs()
+        self.web, self.web_meta, self.web_query = [], {}, ""
+        self.search_web = False      # True while the search box is a web search
+        self.busy = ""               # status text for background work
+        self.start_state = snapshot()
         self.applied = False
         self.previewing = None
         self.orig_video = active_video()
@@ -393,6 +523,8 @@ class Picker:
         self.anim_start = 0.0
         GLib.timeout_add(16, self.tick)
         GLib.idle_add(self.prefetch)
+        if os.environ.get("HILM_WEB_QUERY"):          # test hook: start a web search on open
+            GLib.timeout_add(600, lambda: (self.start_web_search(os.environ["HILM_WEB_QUERY"]), False)[1])
         # put the old wallpaper back if we're killed mid-preview
         try:
             gi.require_version("GLibUnix", "2.0")
@@ -413,24 +545,26 @@ class Picker:
         return p is not IMPORT and (str(p) in self.favs or p.name in self.favs)
 
     def rescan(self):
-        self.sources = scan_sources()
+        self.sources = scan_sources() + [(p, "web", "wallhaven") for p in getattr(self, "web", [])]
         self.src = {p: (kind, label) for p, kind, label in self.sources}
         theme = current_theme_name()
         has = lambda f: any(f(k, l) for _, k, l in self.sources)
-        self.filters = [("ALL", lambda k, l: True)]
+        self.filters = [("ALL", lambda k, l: k != "web")]
         if has(lambda k, l: k == "mine"):
             self.filters.append(("MY COLLECTION", lambda k, l: k == "mine"))
         if theme and has(lambda k, l: k == "theme" and l == theme):
             self.filters.append((f"THEME · {theme.upper()}", lambda k, l: k == "theme" and l == theme))
         if has(lambda k, l: k == "theme"):
             self.filters.append(("ALL THEMES", lambda k, l: k == "theme"))
+        if getattr(self, "web", None):
+            self.filters.append((f"WEB · {self.web_query.upper()[:18]}", lambda k, l: k == "web"))
         self.fidx = min(getattr(self, "fidx", 0), len(self.filters) - 1)
 
     def load_items(self, keep=None, rescan=True):
         if rescan or not hasattr(self, "sources"):
             self.rescan()
         keep_f = self.filters[self.fidx][1]
-        rank = {"mine": 0, "theme": 1}
+        rank = {"mine": 0, "theme": 1, "web": 2}
         walls = [p for p, k, l in self.sources if keep_f(k, l)]
         walls.sort(key=lambda p: (not self.is_fav(p), rank[self.src[p][0]],
                                   self.src[p][1].lower(), p.name.lower()))
@@ -469,6 +603,8 @@ class Picker:
             except Exception:
                 thumb, meta = None, {"res": "", "palette": [], "frame": None}
             blur = thumb.scale_simple(24, 14, GdkPixbuf.InterpType.BILINEAR) if thumb else None
+            if thumb is None:
+                return (None, None, meta)          # don't remember failures: retry next frame
             self.cache[item] = (thumb, blur, meta)
         return self.cache[item]
 
@@ -516,7 +652,7 @@ class Picker:
     def do_preview(self):
         self.preview_src = None
         item = self.items[self.sel]
-        if item is IMPORT or self.applied:
+        if item is IMPORT or self.applied or item in self.web_meta:
             return False
         target = item
         if is_video(item) and not OMARCHY4:
@@ -727,7 +863,7 @@ class Picker:
             ctx.set_source_rgba(*ACCENT, 0.9 * alpha)
             ctx.move_to(x + 16 * scale, y + h - 34 * scale)
             kind, label = self.src.get(item, ("mine", ""))
-            tag = "COLLECTION" if kind == "mine" else label.upper().replace("-", " ")
+            tag = {"mine": "COLLECTION", "web": "WALLHAVEN"}.get(kind) or label.upper().replace("-", " ")
             ctx.show_text(f"#{i + 1:02d}  ·  {tag[:24]}")
             ctx.set_font_size(17 * scale)
             ctx.set_source_rgba(0.96, 0.97, 1, alpha)
@@ -882,7 +1018,7 @@ class Picker:
         if self.search is not None:
             q = self.search + ("▌" if int(now * 2.5) % 2 == 0 else " ")
             ctx.set_font_size(18)
-            text = f"SEARCH › {q}"
+            text = f"{'WEB SEARCH (WALLHAVEN)' if self.search_web else 'SEARCH'} › {q}"
             e = ctx.text_extents(text)
             bw = max(360, e.x_advance + 40)
             rrect(ctx, W / 2 - bw / 2, 104, bw, 44, 10)
@@ -925,25 +1061,31 @@ class Picker:
         if item is IMPORT:
             info = "LOAD IMAGE OR VIDEO FROM DISK"
         else:
-            res = self.entry(item)[2].get("res", "")
+            res = (self.web_meta[item].get("res", "").replace("x", "×") if item in self.web_meta
+                   else self.entry(item)[2].get("res", ""))
             kind, label = self.src.get(item, ("mine", ""))
-            where = "your collection" if kind == "mine" else f"{label} theme"
+            where = {"mine": "your collection", "web": "wallhaven.cc · enter downloads it"}.get(kind) or f"{label} theme"
             info = "  ·  ".join(x for x in (item.name, where, res, "VIDEO" if is_video(item) else "") if x)
         ctx.set_source_rgba(0.85, 0.9, 1, 0.75 * a)
         self.center_text(ctx, info, W / 2, py + 30)
 
         msg_t, msg_at = self.toast
-        if self.confirm_del is not None:
+        if self.busy:
+            dots = "·" * (int(now * 3) % 4)
+            msg = f"{self.busy} {dots}"
+            ctx.set_source_rgba(*ACCENT, a)
+        elif self.confirm_del is not None:
             msg = f"\uf071  PRESS DEL AGAIN TO HIDE {self.items[self.confirm_del].name.upper()}  ·  ESC TO CANCEL"
             ctx.set_source_rgba(1, 0.4, 0.45, (0.7 + 0.3 * math.sin(now * 8)) * a)
         elif msg_t and now - msg_at < 2.2:
             msg = msg_t
             ctx.set_source_rgba(*ACCENT, min(1, 2.2 - (now - msg_at)) * a)
         elif self.search is not None:
-            msg = "TYPE TO FILTER    ENTER CONFIRM    ESC CLEAR"
+            msg = ("TYPE WHAT YOU WANT    ENTER SEARCH WALLHAVEN (SFW)    ESC CANCEL" if self.search_web
+                   else "TYPE TO FILTER    ENTER CONFIRM    ESC CLEAR")
             ctx.set_source_rgba(1, 1, 1, 0.4 * a)
         else:
-            msg = "←/→ NAV   TAB SOURCE   ENTER APPLY   / SEARCH   F FAV   R RANDOM   T ROTATE   O IMPORT   DEL HIDE   ESC EXIT"
+            msg = "←/→ NAV   TAB SOURCE   ENTER APPLY   U UNDO   / SEARCH   W WEB   F FAV   R RANDOM   T ROTATE   O IMPORT   DEL HIDE   ESC"
             ctx.set_source_rgba(1, 1, 1, 0.4 * a)
         ctx.set_font_size(11)
         self.center_text(ctx, msg, W / 2, H - 44)
@@ -960,6 +1102,10 @@ class Picker:
             self.apply(item)
 
     def apply(self, path):
+        if path in self.web_meta:
+            self.download_and_apply(path)
+            return
+        push_history(self.start_state)
         self.applied = True
         if is_video(path) and OMARCHY4:
             # theme from a still frame, then let Omarchy's shell play the video
@@ -984,9 +1130,75 @@ class Picker:
         self.win.close()
         subprocess.Popen(["setsid", "sh", "-c", script])
 
+    def download_and_apply(self, thumb):
+        import threading
+        if self.busy:
+            return
+        meta = self.web_meta[thumb]
+        self.busy = f"DOWNLOADING {meta.get('res', '')} FROM WALLHAVEN…"
+
+        def work():
+            try:
+                dest = web_download(meta, IMPORT_DIR)
+                GLib.idle_add(lambda: (setattr(self, "busy", ""), self.apply(dest), False)[2])
+            except Exception as e:
+                msg = f"\uf00d DOWNLOAD FAILED: {e}"[:80]
+                GLib.idle_add(lambda: (setattr(self, "busy", ""), self.say(msg), False)[2])
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_web_search(self, query):
+        import threading
+        query = query.strip()
+        if not query or self.busy:
+            return
+        self.busy = f"SEARCHING WALLHAVEN FOR “{query.upper()}”…"
+
+        def work():
+            err = ""
+            try:
+                res = web_search(query)
+            except Exception as e:
+                res, err = None, str(e)
+            def done():
+                self.busy = ""
+                if res is None:
+                    self.say(f"\uf00d SEARCH FAILED: {err}"[:80])
+                elif not res:
+                    self.say(f"NO RESULTS FOR “{query.upper()}”")
+                else:
+                    self.web = [p for p, _ in res]
+                    self.web_meta = {p: m for p, m in res}
+                    self.web_query = query
+                    self.rescan()
+                    self.fidx = len(self.filters) - 1          # jump to the WEB source
+                    self.load_items(rescan=False)
+                    self.sel = 0
+                    self.pos = self.anim_from = 0.0
+                    self.prefetch()
+                    self.say(f"{len(res)} RESULTS  ·  ENTER DOWNLOADS TO YOUR COLLECTION")
+                return False
+            GLib.idle_add(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def undo(self):
+        state = pop_history()
+        if not state:
+            self.say("NOTHING TO UNDO")
+            return
+        cmd = restore_script(state)
+        if not cmd:
+            self.say("\uf00d PREVIOUS WALLPAPER NO LONGER EXISTS")
+            return
+        self.applied = True
+        self.win.close()
+        subprocess.Popen(["setsid", "sh", "-c", cmd])
+
     def remove(self):
         item = self.items[self.sel]
         if item is IMPORT:
+            return
+        if item in self.web_meta:
+            self.say("WEB RESULTS AREN'T SAVED YET  ·  ENTER TO DOWNLOAD")
             return
         if self.confirm_del != self.sel:
             self.confirm_del = self.sel
@@ -1004,7 +1216,7 @@ class Picker:
 
     def toggle_fav(self):
         item = self.items[self.sel]
-        if item is IMPORT:
+        if item is IMPORT or item in self.web_meta:
             return
         if self.is_fav(item):
             self.favs.discard(item.name)
@@ -1089,17 +1301,21 @@ class Picker:
             if k == Gdk.KEY_Escape:
                 self.search = None
             elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                if self.search_web:
+                    self.start_web_search(self.search)
                 self.search = None
             elif k == Gdk.KEY_BackSpace:
                 self.search = self.search[:-1]
-                self.search_update()
+                if not self.search_web:
+                    self.search_update()
             elif k in (Gdk.KEY_Left, Gdk.KEY_Right):
                 self.go(self.sel + (1 if k == Gdk.KEY_Right else -1))
             else:
                 ch = chr(Gdk.keyval_to_unicode(k)) if Gdk.keyval_to_unicode(k) else ""
                 if ch.isprintable() and ch:
                     self.search += ch
-                    self.search_update()
+                    if not self.search_web:
+                        self.search_update()
             return True
 
         if k in (Gdk.KEY_Escape, Gdk.KEY_q):
@@ -1132,7 +1348,11 @@ class Picker:
         elif k == Gdk.KEY_t:
             self.toggle_rotate()
         elif k == Gdk.KEY_slash:
-            self.search = ""
+            self.search, self.search_web = "", False
+        elif k == Gdk.KEY_w:
+            self.search, self.search_web = "", True
+        elif k == Gdk.KEY_u:
+            self.undo()
         return True
 
     def on_scroll(self, _w, ev):
@@ -1181,6 +1401,15 @@ def main():
     import sys
     if "--version" in sys.argv:
         print(f"omarchy-hilm {VERSION}")
+        return
+    if sys.argv[1:2] == ["undo"]:
+        state = pop_history()
+        cmd = restore_script(state) if state else None
+        if not cmd:
+            print("Nothing to undo." if not state else "The previous wallpaper no longer exists.")
+            return
+        print(f"Restoring {Path(state['bg']).name} with theme '{state.get('theme') or 'hilm'}'")
+        subprocess.run(["sh", "-c", cmd])
         return
     Picker()
     Gtk.main()
