@@ -43,7 +43,7 @@ Then press **SUPER + CTRL + SPACE**.
 The installer is a short guided wizard:
 
 1. **Scan.** Checks your Omarchy version, what's already installed and which features you'll get.
-2. **Wallpaper folder.** If you already have `~/.config/omarchy/wallpapers`, it uses that. Otherwise it lists the image folders it finds (`~/Pictures/Wallpapers`, `~/Pictures` and so on) with how many images each holds. You can also create the Omarchy folder or type any path.
+2. **Wallpaper sources.** Every Omarchy theme's backgrounds are always included. If you also keep your own collection, the wizard finds image folders like `~/Pictures/Wallpapers` and shows how many images each holds. Pick one, type any path, or skip it.
 3. **Summary.** Shows exactly what will change before anything happens.
 4. **Install.** Runs each step with live progress.
 
@@ -54,7 +54,7 @@ Running the installer again updates the picker and keeps your settings.
 | Flag | Effect |
 |---|---|
 | `--yes` | Use all the defaults, no questions asked |
-| `--dir ~/Pictures/Walls` | Use this wallpaper folder |
+| `--dir ~/Pictures/Walls` | Use this folder as your own collection |
 | `--no-keybind` | Don't add the shortcut |
 
 ### What it changes
@@ -84,6 +84,7 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 | Key | Action |
 |---|---|
 | ← / → , h / l, scroll | Move between cards |
+| Tab / Shift+Tab, or click the chips | Switch source: **All · My collection · Current theme · All themes** |
 | Enter / Space / click | Apply |
 | `/` | Search by name |
 | `f` | Favourite (★ favourites sort first) |
@@ -97,8 +98,10 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 
 - **Video and GIF wallpapers:** these work out of the box on Omarchy 4. On Omarchy 3, install `mpvpaper` first with `yay -S mpvpaper`. Then import or drop `.mp4`, `.webm`, `.mkv`, `.mov` or `.gif` files into your wallpaper folder.
 - **Auto-rotate:** `omarchy-hilm-rotate on|off|next|interval <minutes>`. It rotates through your favourites, or the whole pool if you have none. The default interval is 30 minutes.
-- **Adding wallpapers:** put images in your wallpaper folder (subfolders up to 2 levels deep are included), or use the Import card. Importing copies the file into your folder and never overwrites anything.
-- **Changing folders:** run the installer again, or edit `WALLPAPER_DIR` in `~/.config/omarchy-hilm/config`.
+- **Where wallpapers come from:** the backgrounds of every installed Omarchy theme (built-in and ones you've added), your per-theme extras in `~/.config/omarchy/backgrounds/<theme>/`, and your own collection folder if you chose one. Each card shows its source, and the same image found in two places is shown once.
+- **Only your collection:** set `INCLUDE_THEMES="0"` in `~/.config/omarchy-hilm/config` to show just your collection.
+- **Adding wallpapers:** put images in your collection folder (subfolders up to 2 levels deep are included), or use the Import card. Importing copies the file into your folder and never overwrites anything.
+- **Changing your collection:** run the installer again, or edit `WALLPAPER_DIR` in `~/.config/omarchy-hilm/config`. Leave it empty to use theme backgrounds only.
 - **Unhiding wallpapers:** delete the line from `~/.config/omarchy-hilm/hidden`, or delete the whole file to unhide everything.
 
 ## Troubleshooting

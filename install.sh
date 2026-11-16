@@ -11,7 +11,7 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 set -euo pipefail
 
-VERSION="1.1.2"
+VERSION="1.2.0"
 REPO="https://github.com/Dagmawi-M/omarchy-hilm"
 BIN="$HOME/.local/bin"
 SHARE="$HOME/.local/share/omarchy-hilm"
@@ -182,65 +182,84 @@ else
 fi
 [[ -f $BIN/omarchy-hilm ]] && info "Existing install found: will update in place"
 
-# ── 2. wallpaper folder ──────────────────────────────────────────────────────
-title "02" "WALLPAPER FOLDER"
-PREV=""
-[[ -f $CONF_DIR/config ]] && PREV="$(grep -oP '^WALLPAPER_DIR="?\K[^"]*' "$CONF_DIR/config" || true)"
-PREV="${PREV/#\~/$HOME}"
-SEED=0
+# ── 2. wallpaper sources ─────────────────────────────────────────────────────
+title "02" "WALLPAPER SOURCES"
+theme_count() {
+  local n=0 t=0 d c
+  for d in "$OMARCHY_DIR"/themes/*/backgrounds "$HOME"/.config/omarchy/themes/*/backgrounds "$HOME"/.config/omarchy/backgrounds/*/; do
+    [[ -d $d ]] || continue
+    case "$d" in */themes/hilm/*|*/themes/wallpaper/*|*/themes/wallpaper-cards/*) continue ;; esac
+    c=$(count_images "$d"); ((c > 0)) && { n=$((n + c)); t=$((t + 1)); }
+  done
+  echo "$n $t"
+}
+read -r TN TT < <(theme_count)
+ok "Theme backgrounds: ${B}$TN wallpapers from $TT themes${N} ${D}(always included, updates with Omarchy)${N}"
+
+PREV="" HAD_CONF=0
+if [[ -f $CONF_DIR/config ]]; then
+  HAD_CONF=1
+  PREV="$(grep -oP '^WALLPAPER_DIR="?\K[^"]*' "$CONF_DIR/config" || true)"
+  PREV="${PREV/#\~/$HOME}"
+fi
+POOL="__ask__"
 
 if [[ -n $DIR_ARG ]]; then
   POOL="${DIR_ARG/#\~/$HOME}"
 elif [[ -n $PREV && -d $PREV ]]; then
-  POOL="$PREV"; ok "Using your current folder: ${POOL/#$HOME/\~} ($(count_images "$POOL") images)"
-  ((YES)) || ask_yes "Keep this folder?" || POOL=""
+  ok "Your collection: ${PREV/#$HOME/\~} ($(count_images "$PREV") images)"
+  POOL="$PREV"
+  ((YES)) || ask_yes "Keep using this collection folder?" || POOL="__ask__"
+elif ((HAD_CONF)) && [[ -z $PREV ]] && ((YES)); then
+  POOL=""                                      # previously chose theme backgrounds only
 elif [[ -d $OMARCHY_POOL ]] && (( $(count_images "$OMARCHY_POOL") > 0 )); then
-  POOL="$OMARCHY_POOL"; ok "Found Omarchy wallpaper folder: ~/.config/omarchy/wallpapers ($(count_images "$POOL") images)"
-else
+  ok "Your collection: ~/.config/omarchy/wallpapers ($(count_images "$OMARCHY_POOL") images)"
+  POOL="$OMARCHY_POOL"
+  ((YES)) || ask_yes "Use this as your collection?" || POOL="__ask__"
+elif ((YES)); then
   POOL=""
 fi
 
-if [[ -z $POOL ]]; then
-  if ((YES)); then
-    POOL="$OMARCHY_POOL"; SEED=1
-  else
-    info "Where do you keep your wallpapers? ${D}(files are only read, never moved or deleted)${N}"
-    echo
-    opts=(); paths=()
-    for c in "$HOME/Pictures/Wallpapers" "$HOME/Pictures/wallpapers" "$HOME/Wallpapers" "$HOME/wallpapers" \
-             "$HOME/.config/omarchy/backgrounds" "$HOME/Pictures"; do
-      [[ -d $c ]] || continue
-      n=$(count_images "$c"); ((n > 0)) || continue
-      opts+=("${c/#$HOME/\~}  ($n images)"); paths+=("$c")
+if [[ $POOL == "__ask__" ]]; then
+  info "Do you also have your own wallpaper collection? ${D}(only read: never moved or deleted)${N}"
+  echo
+  opts=(); paths=()
+  for c in "$HOME/Pictures/Wallpapers" "$HOME/Pictures/wallpapers" "$HOME/Wallpapers" "$HOME/wallpapers" \
+           "$OMARCHY_POOL" "$HOME/Pictures"; do
+    [[ -d $c ]] || continue
+    n=$(count_images "$c"); ((n > 0)) || continue
+    opts+=("${c/#$HOME/\~}  ($n images)"); paths+=("$c")
+  done
+  opts+=("✎ Type a folder path…"); paths+=("__custom__")
+  opts+=("✕ No, just use theme backgrounds"); paths+=("")
+
+  pick="$(ask_choose "Your own collection:" "${opts[@]}")" || die "Cancelled."
+  POOL=""
+  for i in "${!opts[@]}"; do [[ ${opts[i]} == "$pick" ]] && POOL="${paths[i]}"; done
+
+  if [[ $POOL == "__custom__" ]]; then
+    POOL=""
+    while :; do
+      p="$(ask_input "Folder (empty to skip)" "~/Pictures/Wallpapers")"
+      p="${p/#\~/$HOME}"; p="${p%/}"
+      [[ -z $p ]] && break
+      if [[ -d $p ]]; then POOL="$p"; break; fi
+      if ask_yes "'${p/#$HOME/\~}' doesn't exist. Create it?"; then mkdir -p "$p"; POOL="$p"; break; fi
     done
-    opts+=("✚ Create Omarchy folder ~/.config/omarchy/wallpapers (starts with copies of your theme's backgrounds)")
-    paths+=("__create__")
-    opts+=("✎ Type another folder path…"); paths+=("__custom__")
-
-    pick="$(ask_choose "Choose your wallpaper folder:" "${opts[@]}")" || die "Cancelled."
-    for i in "${!opts[@]}"; do [[ ${opts[i]} == "$pick" ]] && POOL="${paths[i]}"; done
-    [[ -n $POOL ]] || POOL="__create__"
-
-    if [[ $POOL == "__create__" ]]; then
-      POOL="$OMARCHY_POOL"; SEED=1
-    elif [[ $POOL == "__custom__" ]]; then
-      while :; do
-        p="$(ask_input "Folder" "~/Pictures/Wallpapers")"
-        p="${p/#\~/$HOME}"; p="${p%/}"
-        [[ -z $p ]] && { POOL="$OMARCHY_POOL"; SEED=1; break; }
-        if [[ -d $p ]]; then POOL="$p"; break; fi
-        if ask_yes "'${p/#$HOME/\~}' doesn't exist. Create it?"; then mkdir -p "$p"; POOL="$p"; break; fi
-      done
-    fi
   fi
 fi
-POOL="$(realpath -m "$POOL")"
-ok "Wallpaper folder: ${B}${POOL/#$HOME/\~}${N}"
+
+if [[ -n $POOL ]]; then
+  POOL="$(realpath -m "$POOL")"
+  ok "Collection: ${B}${POOL/#$HOME/\~}${N} + all theme backgrounds"
+else
+  ok "Using ${B}theme backgrounds${N} ${D}(imports go to ~/.config/omarchy/wallpapers)${N}"
+fi
 
 # ── 3. confirm ───────────────────────────────────────────────────────────────
 title "03" "READY TO INSTALL"
 printf "  ${D}scripts   ${N} ~/.local/bin/{omarchy-hilm,-theme,-rotate}\n"
-printf "  ${D}wallpapers${N} %s\n" "${POOL/#$HOME/\~}"
+printf "  ${D}wallpapers${N} %s\n" "$([[ -n $POOL ]] && echo "${POOL/#$HOME/\~} + $TN theme backgrounds" || echo "$TN theme backgrounds")"
 ((${#missing[@]})) && printf "  ${D}packages  ${N} %s\n" "${missing[*]}"
 ((KEYBIND)) && printf "  ${D}shortcut  ${N} SUPER + CTRL + SPACE ${D}(replaces Omarchy's default background shortcut)${N}\n"
 printf "  ${D}theme     ${N} %s\n" "$( ((FULL)) && echo "creates its own 'hilm' theme. Your themes are untouched" || echo "wallpaper only")"
@@ -296,18 +315,8 @@ do_config() {
 }
 run "Saving settings" do_config; tick
 
-do_pool() {
-  mkdir -p "$POOL"
-  ((SEED)) || return 0
-  local theme; theme="$(cat "$STATE/theme.name" 2>/dev/null || true)"
-  for d in "$STATE/theme/backgrounds" "$HOME/.config/omarchy/backgrounds/$theme" \
-           "$OMARCHY_DIR/themes/$theme/backgrounds"; do
-    [[ -d $d ]] || continue
-    for f in "$d"/*; do [[ -f $f ]] && cp -Ln "$f" "$POOL/" 2>/dev/null; done
-  done
-  true
-}
-run "Preparing wallpaper folder" do_pool; tick
+do_pool() { [[ -z $POOL ]] || mkdir -p "$POOL"; }
+run "Preparing wallpaper sources" do_pool; tick
 
 do_thumbs() {  # warm the thumbnail cache so the first launch is instant
   PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 - "$BIN/omarchy-hilm" <<'PY'
@@ -316,13 +325,13 @@ from importlib.machinery import SourceFileLoader
 spec = importlib.util.spec_from_loader("hilm", SourceFileLoader("hilm", sys.argv[1]))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-for p in m.scan_pool()[:200]:
+for p in m.scan_pool()[:120]:
     try: m.build_cache(p)
     except Exception: pass
 PY
 }
 if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
-  run "Generating thumbnails ($(count_images "$POOL") images)" do_thumbs || warn "Thumbnails will be generated on first launch"
+  run "Generating thumbnails" do_thumbs || warn "Thumbnails will be generated on first launch"
 else
   info "Thumbnails will be generated on first launch"
 fi
@@ -382,13 +391,13 @@ if ((HAS_GUM)); then
   gum style --border rounded --border-foreground 51 --padding "1 3" --margin "0 2" \
     "$(gum style --foreground 51 --bold '◢ INSTALLED')" "" \
     "Open it:      $(gum style --bold 'SUPER + CTRL + SPACE')  or  omarchy-hilm" \
-    "Wallpapers:   ${POOL/#$HOME/~}" \
+    "Wallpapers:   $([[ -n $POOL ]] && echo "${POOL/#$HOME/~} + theme backgrounds" || echo "theme backgrounds (Tab switches source)")" \
     "Uninstall:    ~/.local/share/omarchy-hilm/uninstall.sh" \
     "" "$(gum style --faint 'Nothing of yours was moved or deleted.')"
 else
   printf "  ${C}${B}◢ INSTALLED${N}\n\n"
   printf "  Open it:     ${B}SUPER + CTRL + SPACE${N}  or  omarchy-hilm\n"
-  printf "  Wallpapers:  %s\n" "${POOL/#$HOME/\~}"
+  printf "  Wallpapers:  %s\n" "$([[ -n $POOL ]] && echo "${POOL/#$HOME/\~} + theme backgrounds" || echo "theme backgrounds (Tab switches source)")"
   printf "  Uninstall:   ~/.local/share/omarchy-hilm/uninstall.sh\n"
 fi
 ((OMARCHY4)) || command -v mpvpaper >/dev/null || printf "\n  ${D}Tip: 'yay -S mpvpaper' enables video/GIF wallpapers.${N}\n"

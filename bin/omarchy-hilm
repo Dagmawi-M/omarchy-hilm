@@ -4,7 +4,10 @@
 Cover-flow of holographic cards over a LIVE preview of the focused
 wallpaper, tinted with the current omarchy theme accent.
 
+Shows your own collection plus every Omarchy theme's backgrounds.
+
 Keys:  ←/→ h/l, scroll   navigate        Enter/Space  apply
+       Tab / Shift+Tab   switch source (all · collection · theme · all themes)
        /  then type      search          f            favourite
        r                 random spin     t            toggle auto-rotate
        Del/x (twice)     hide (file is kept)          o            import from file
@@ -37,18 +40,41 @@ CONF_FILE = CONF_DIR / "config"
 HIDDEN = CONF_DIR / "hidden"
 
 
-def read_pool():
-    """Wallpaper folder chosen in the installer (config file), else Omarchy's."""
+def read_conf(key, default=None):
     try:
-        m = re.search(r'^WALLPAPER_DIR="?(.*?)"?\s*$', CONF_FILE.read_text(), re.M)
-        if m and m.group(1):
-            return Path(os.path.expanduser(m.group(1)))
+        m = re.search(rf'^{key}="?(.*?)"?\s*$', CONF_FILE.read_text(), re.M)
+        if m:
+            return m.group(1)
     except OSError:
         pass
-    return HOME / ".config/omarchy/wallpapers"
+    return default
+
+
+def read_pool():
+    """The user's own collection (chosen in the installer). Optional: theme
+    backgrounds are always included on top of it."""
+    v = read_conf("WALLPAPER_DIR")
+    if v:
+        return Path(os.path.expanduser(v))
+    if v is None and (HOME / ".config/omarchy/wallpapers").is_dir():
+        return HOME / ".config/omarchy/wallpapers"
+    return None
 
 
 POOL = read_pool()
+IMPORT_DIR = POOL or HOME / ".config/omarchy/wallpapers"   # where imported files are copied
+INCLUDE_THEMES = read_conf("INCLUDE_THEMES", "1") != "0"
+
+
+def _omarchy_path():
+    for c in (os.environ.get("OMARCHY_PATH"), HOME / ".local/share/omarchy", "/usr/share/omarchy"):
+        if c and Path(c).is_dir():
+            return Path(c)
+    return HOME / ".local/share/omarchy"
+
+
+OMARCHY_PATH = _omarchy_path()
+GENERATED_THEMES = {"hilm", "wallpaper", "wallpaper-cards"}   # themes hilm itself generates (current + legacy names)
 # Omarchy 4 keeps state in ~/.local/state and draws the background with
 # omarchy-shell; Omarchy 3 uses ~/.config/omarchy/current and swaybg.
 STATE_V4 = HOME / ".local/state/omarchy/current"
@@ -70,7 +96,7 @@ RADIUS = 14
 SPACING = 300
 FONT = "JetBrainsMono Nerd Font"
 IMPORT = object()
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 
 
 # ---------------------------------------------------------------- helpers
@@ -139,22 +165,70 @@ def hide(path):
         f.write(str(path) + "\n")
 
 
-def scan_pool():
-    """Images/videos in the pool and its subfolders (2 levels deep), skipping hidden ones."""
-    if not POOL.is_dir():
-        return []
-    hidden, out = load_hidden(), []
+def walk_media(root, max_depth=2):
+    """Images/videos under `root` (subfolders up to max_depth), symlinks followed."""
+    if not root or not Path(root).is_dir():
+        return
     exts = IMAGE_EXT | VIDEO_EXT
-    for root, dirs, files in os.walk(POOL):
-        depth = Path(root).relative_to(POOL).parts
-        dirs[:] = [d for d in dirs if not d.startswith(".")] if len(depth) < 2 else []
-        for f in files:
-            p = Path(root) / f
-            if p.suffix.lower() in exts and not f.startswith(".") and str(p) not in hidden:
-                out.append(p)
-            if len(out) >= 1000:
-                return out
+    for dirpath, dirs, files in os.walk(root, followlinks=True):
+        depth = len(Path(dirpath).relative_to(root).parts)
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".")) if depth < max_depth else []
+        for f in sorted(files):
+            if not f.startswith(".") and Path(f).suffix.lower() in exts:
+                yield Path(dirpath) / f
+
+
+def current_theme_name():
+    try:
+        return (CUR_DIR / "theme.name").read_text().strip()
+    except OSError:
+        return ""
+
+
+def theme_dirs():
+    """(theme name, folder) for every place Omarchy keeps theme backgrounds."""
+    for base in (OMARCHY_PATH / "themes", HOME / ".config/omarchy/themes"):
+        if base.is_dir():
+            for t in sorted(base.iterdir()):
+                if t.name not in GENERATED_THEMES and (t / "backgrounds").is_dir():
+                    yield t.name, t / "backgrounds"
+    extra = HOME / ".config/omarchy/backgrounds"      # user's per-theme additions
+    if extra.is_dir():
+        for t in sorted(extra.iterdir()):
+            if t.is_dir():
+                yield t.name, t
+
+
+def scan_sources():
+    """All wallpapers as (path, kind, label); kind is "mine" or "theme".
+    Duplicates (same real file, e.g. symlinks) appear once; hidden ones are skipped."""
+    hidden, seen, out = load_hidden(), set(), []
+
+    def add(p, kind, label):
+        try:
+            real = os.path.realpath(p)
+        except OSError:
+            return
+        if real in seen or str(p) in hidden or real in hidden or not os.path.isfile(real):
+            return
+        seen.add(real)
+        out.append((p, kind, label))
+
+    for p in walk_media(POOL):
+        add(p, "mine", "COLLECTION")
+        if len(out) >= 2000:
+            return out
+    if INCLUDE_THEMES:
+        for name, d in theme_dirs():
+            for p in walk_media(d, max_depth=0):
+                add(p, "theme", name)
+            if len(out) >= 2000:
+                break
     return out
+
+
+def scan_pool():
+    return [p for p, _, _ in scan_sources()]
 
 
 def cache_key(path):
@@ -218,8 +292,12 @@ def build_cache(path):
     thumb = sc.new_subpixbuf((nw - CARD_W) // 2, (nh - CARD_H) // 2, CARD_W, CARD_H).copy()
     meta = {"res": res, "palette": palette_of(src),
             "frame": str(src_file) if is_video(path) else None}
-    thumb.savev(str(tp), "png", [], [])
-    mp.write_text(json.dumps(meta))
+    tmp = tp.with_suffix(f".{os.getpid()}.tmp")
+    thumb.savev(str(tmp), "png", [], [])
+    os.replace(tmp, tp)
+    mtmp = mp.with_suffix(f".{os.getpid()}.tmp")
+    mtmp.write_text(json.dumps(meta))
+    os.replace(mtmp, mp)
     return thumb, meta
 
 
@@ -316,8 +394,14 @@ class Picker:
         GLib.timeout_add(16, self.tick)
         GLib.idle_add(self.prefetch)
         # put the old wallpaper back if we're killed mid-preview
+        try:
+            gi.require_version("GLibUnix", "2.0")
+            from gi.repository import GLibUnix
+            add_signal = GLibUnix.signal_add
+        except (ValueError, ImportError):
+            add_signal = GLib.unix_signal_add          # older PyGObject
         for sig in (2, 15, 1):  # SIGINT, SIGTERM, SIGHUP
-            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self.on_signal)
+            add_signal(GLib.PRIORITY_HIGH, sig, self.on_signal)
         self.win.show_all()
 
     def on_signal(self):
@@ -325,9 +409,31 @@ class Picker:
         return False
 
     # ---------- data ----------
-    def load_items(self, keep=None):
-        walls = scan_pool()
-        walls.sort(key=lambda p: (p.name not in self.favs, p.name.lower()))
+    def is_fav(self, p):
+        return p is not IMPORT and (str(p) in self.favs or p.name in self.favs)
+
+    def rescan(self):
+        self.sources = scan_sources()
+        self.src = {p: (kind, label) for p, kind, label in self.sources}
+        theme = current_theme_name()
+        has = lambda f: any(f(k, l) for _, k, l in self.sources)
+        self.filters = [("ALL", lambda k, l: True)]
+        if has(lambda k, l: k == "mine"):
+            self.filters.append(("MY COLLECTION", lambda k, l: k == "mine"))
+        if theme and has(lambda k, l: k == "theme" and l == theme):
+            self.filters.append((f"THEME · {theme.upper()}", lambda k, l: k == "theme" and l == theme))
+        if has(lambda k, l: k == "theme"):
+            self.filters.append(("ALL THEMES", lambda k, l: k == "theme"))
+        self.fidx = min(getattr(self, "fidx", 0), len(self.filters) - 1)
+
+    def load_items(self, keep=None, rescan=True):
+        if rescan or not hasattr(self, "sources"):
+            self.rescan()
+        keep_f = self.filters[self.fidx][1]
+        rank = {"mine": 0, "theme": 1}
+        walls = [p for p, k, l in self.sources if keep_f(k, l)]
+        walls.sort(key=lambda p: (not self.is_fav(p), rank[self.src[p][0]],
+                                  self.src[p][1].lower(), p.name.lower()))
         self.items = walls + [IMPORT]
         cur, vid = current_path(), active_video()
         self.sel = 0
@@ -337,6 +443,17 @@ class Picker:
                     self.sel = i
             elif (vid and str(w) == vid) or (not vid and cur and os.path.realpath(w) == cur):
                 self.sel = i
+        self.chip_hits = []
+
+    def cycle_filter(self, step):
+        if len(self.filters) < 2:
+            return
+        cur = self.items[self.sel] if self.items[self.sel] is not IMPORT else None
+        self.fidx = (self.fidx + step) % len(self.filters)
+        self.load_items(keep=cur, rescan=False)
+        self.pos = self.anim_from = float(self.sel)
+        self.switch_t = time.monotonic() - self.t0
+        self.say(self.filters[self.fidx][0])
 
     def is_active(self, item):
         vid = self.orig_video
@@ -356,12 +473,22 @@ class Picker:
         return self.cache[item]
 
     def prefetch(self):
-        # warm the cache outward from the selection, one per idle
+        # warm the on-disk thumbnail cache in the background, nearest cards first
+        import threading
         order = sorted(range(len(self.items) - 1), key=lambda i: abs(i - self.sel))
-        for i in order:
-            if self.items[i] not in self.cache:
-                self.entry(self.items[i])
-                return True
+        paths = [self.items[i] for i in order] + [p for p, _, _ in self.sources]
+
+        def work():
+            done = set()
+            for p in paths:
+                if p in done:
+                    continue
+                done.add(p)
+                try:
+                    build_cache(p)
+                except Exception:
+                    pass
+        threading.Thread(target=work, daemon=True).start()
         return False
 
     # ---------- motion ----------
@@ -599,7 +726,9 @@ class Picker:
             ctx.set_font_size(11 * scale)
             ctx.set_source_rgba(*ACCENT, 0.9 * alpha)
             ctx.move_to(x + 16 * scale, y + h - 34 * scale)
-            ctx.show_text(f"#{i + 1:02d}")
+            kind, label = self.src.get(item, ("mine", ""))
+            tag = "COLLECTION" if kind == "mine" else label.upper().replace("-", " ")
+            ctx.show_text(f"#{i + 1:02d}  ·  {tag[:24]}")
             ctx.set_font_size(17 * scale)
             ctx.set_source_rgba(0.96, 0.97, 1, alpha)
             ctx.move_to(x + 16 * scale, y + h - 14 * scale)
@@ -624,7 +753,7 @@ class Picker:
                 chip_x = self.draw_chip(ctx, chip_x, y + 14 * scale, "● ACTIVE", scale, alpha) - 6 * scale
             if is_video(item):
                 chip_x = self.draw_chip(ctx, chip_x, y + 14 * scale, "\uf04b LIVE", scale, alpha, ACCENT2) - 6 * scale
-            if item.name in self.favs:
+            if self.is_fav(item):
                 ctx.set_font_size(20 * scale)
                 ctx.set_source_rgba(1, 0.82, 0.3, alpha)
                 ctx.move_to(x + 14 * scale, y + 32 * scale)
@@ -714,11 +843,40 @@ class Picker:
         ctx.move_to(W - 48 - e.x_advance, 90)
         ctx.show_text(idx)
         ctx.set_font_size(11)
-        lab = f"INDEX  ·  \uf005 {len([i for i in self.items[:-1] if i.name in self.favs])}"
+        lab = f"INDEX  ·  \uf005 {len([i for i in self.items[:-1] if self.is_fav(i)])}"
         e2 = ctx.text_extents(lab)
         ctx.set_source_rgba(*ACCENT, 0.9 * a)
         ctx.move_to(W - 48 - e2.x_advance, 56)
         ctx.show_text(lab)
+
+        # source filter chips (Tab / click)
+        self.chip_hits = []
+        if len(self.filters) > 1:
+            ctx.set_font_size(11)
+            pads, gap = 14, 8
+            widths = [ctx.text_extents(n).x_advance + pads * 2 for n, _ in self.filters]
+            x = W / 2 - (sum(widths) + gap * (len(widths) - 1)) / 2
+            for k, ((name, _), cw) in enumerate(zip(self.filters, widths)):
+                on = k == self.fidx
+                rrect(ctx, x, 46, cw, 26, 13)
+                if on:
+                    ctx.set_source_rgba(*ACCENT, 0.95 * a)
+                    ctx.fill()
+                    ctx.set_source_rgba(0.02, 0.05, 0.1, a)
+                else:
+                    ctx.set_source_rgba(1, 1, 1, 0.06 * a)
+                    ctx.fill_preserve()
+                    ctx.set_source_rgba(1, 1, 1, 0.16 * a)
+                    ctx.set_line_width(1)
+                    ctx.stroke()
+                    ctx.set_source_rgba(0.85, 0.9, 1, 0.75 * a)
+                ctx.move_to(x + pads, 63)
+                ctx.show_text(name)
+                self.chip_hits.append((k, x, 46, cw, 26))
+                x += cw + gap
+            ctx.set_font_size(10)
+            ctx.set_source_rgba(1, 1, 1, 0.3 * a)
+            self.center_text(ctx, "TAB TO SWITCH SOURCE", W / 2, 88)
 
         # search box
         if self.search is not None:
@@ -727,26 +885,36 @@ class Picker:
             text = f"SEARCH › {q}"
             e = ctx.text_extents(text)
             bw = max(360, e.x_advance + 40)
-            rrect(ctx, W / 2 - bw / 2, 52, bw, 44, 10)
+            rrect(ctx, W / 2 - bw / 2, 104, bw, 44, 10)
             ctx.set_source_rgba(0.03, 0.05, 0.09, 0.85 * a)
             ctx.fill_preserve()
             ctx.set_source_rgba(*ACCENT, 0.9 * a)
             ctx.set_line_width(1.5)
             ctx.stroke()
-            ctx.move_to(W / 2 - bw / 2 + 20, 80)
+            ctx.move_to(W / 2 - bw / 2 + 20, 132)
             ctx.show_text(text)
 
         total = len(self.items)
         pw = 18
         start = W / 2 - total * (pw + 6) / 2
         py = H / 2 + CARD_H / 2 + 70
+        if total > 36:   # too many for pips: a scrub bar
+            bw = 520
+            ctx.rectangle(W / 2 - bw / 2, py + 1, bw, 2)
+            ctx.set_source_rgba(1, 1, 1, 0.15 * a)
+            ctx.fill()
+            mx = W / 2 - bw / 2 + bw * (self.pos / max(1, total - 1))
+            ctx.rectangle(mx - 14, py, 28, 4)
+            ctx.set_source_rgba(*ACCENT, a)
+            ctx.fill()
+            total = 0
         for i in range(total):
             on = i == self.sel
             ctx.rectangle(start + i * (pw + 6), py, pw, 4 if on else 3)
             it = self.items[i]
             if on:
                 ctx.set_source_rgba(*ACCENT, a)
-            elif it is not IMPORT and it.name in self.favs:
+            elif self.is_fav(it):
                 ctx.set_source_rgba(1, 0.82, 0.3, 0.6 * a)
             else:
                 ctx.set_source_rgba(1, 1, 1, 0.18 * a)
@@ -758,7 +926,9 @@ class Picker:
             info = "LOAD IMAGE OR VIDEO FROM DISK"
         else:
             res = self.entry(item)[2].get("res", "")
-            info = "  ·  ".join(x for x in (item.name, res, "VIDEO" if is_video(item) else "") if x)
+            kind, label = self.src.get(item, ("mine", ""))
+            where = "your collection" if kind == "mine" else f"{label} theme"
+            info = "  ·  ".join(x for x in (item.name, where, res, "VIDEO" if is_video(item) else "") if x)
         ctx.set_source_rgba(0.85, 0.9, 1, 0.75 * a)
         self.center_text(ctx, info, W / 2, py + 30)
 
@@ -773,7 +943,7 @@ class Picker:
             msg = "TYPE TO FILTER    ENTER CONFIRM    ESC CLEAR"
             ctx.set_source_rgba(1, 1, 1, 0.4 * a)
         else:
-            msg = "←/→ NAV   ENTER APPLY   / SEARCH   F FAV   R RANDOM   T ROTATE   O IMPORT   DEL HIDE   ESC EXIT"
+            msg = "←/→ NAV   TAB SOURCE   ENTER APPLY   / SEARCH   F FAV   R RANDOM   T ROTATE   O IMPORT   DEL HIDE   ESC EXIT"
             ctx.set_source_rgba(1, 1, 1, 0.4 * a)
         ctx.set_font_size(11)
         self.center_text(ctx, msg, W / 2, H - 44)
@@ -836,14 +1006,15 @@ class Picker:
         item = self.items[self.sel]
         if item is IMPORT:
             return
-        if item.name in self.favs:
+        if self.is_fav(item):
             self.favs.discard(item.name)
+            self.favs.discard(str(item))
             self.say("\uf006 UNFAVOURITED")
         else:
-            self.favs.add(item.name)
+            self.favs.add(str(item))
             self.say("\uf005 FAVOURITED")
         save_favs(self.favs)
-        self.load_items(keep=item)
+        self.load_items(keep=item, rescan=False)
         self.pos = self.anim_from = float(self.sel)
 
     def spin(self):
@@ -868,7 +1039,7 @@ class Picker:
         if not q:
             return
         for i, it in enumerate(self.items[:-1]):
-            if q in it.name.lower():
+            if q in it.name.lower() or q in self.src.get(it, ("", ""))[1].lower():
                 self.go(i, dur=0.25)
                 return
 
@@ -892,14 +1063,14 @@ class Picker:
             return
         target = chosen
         try:
-            POOL.mkdir(parents=True, exist_ok=True)
-            if POOL in chosen.resolve().parents:
+            IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+            if POOL and POOL.resolve() in chosen.resolve().parents:
                 target = chosen
             else:
-                dest = POOL / chosen.name
+                dest = IMPORT_DIR / chosen.name
                 n = 1
                 while dest.exists() and not dest.samefile(chosen):
-                    dest = POOL / f"{chosen.stem}-{n}{chosen.suffix}"
+                    dest = IMPORT_DIR / f"{chosen.stem}-{n}{chosen.suffix}"
                     n += 1
                 if not dest.exists():
                     shutil.copy2(chosen, dest)
@@ -938,8 +1109,12 @@ class Picker:
                 self.win.close()
         elif k in (Gdk.KEY_Left, Gdk.KEY_h, Gdk.KEY_a, Gdk.KEY_Up, Gdk.KEY_k):
             self.go(self.sel - 1)
-        elif k in (Gdk.KEY_Right, Gdk.KEY_l, Gdk.KEY_d, Gdk.KEY_Down, Gdk.KEY_j, Gdk.KEY_Tab):
+        elif k in (Gdk.KEY_Right, Gdk.KEY_l, Gdk.KEY_d, Gdk.KEY_Down, Gdk.KEY_j):
             self.go(self.sel + 1)
+        elif k == Gdk.KEY_Tab:
+            self.cycle_filter(1)
+        elif k == Gdk.KEY_ISO_Left_Tab:
+            self.cycle_filter(-1)
         elif k == Gdk.KEY_Home:
             self.go(0)
         elif k == Gdk.KEY_End:
@@ -977,6 +1152,11 @@ class Picker:
         if ev.button == 3:
             self.win.close()
             return True
+        for k, x, y, w, h in self.chip_hits:
+            if x <= ev.x <= x + w and y <= ev.y <= y + h:
+                if k != self.fidx:
+                    self.cycle_filter(k - self.fidx)
+                return True
         for i, x, y, w, h in reversed(self.hits):
             if x <= ev.x <= x + w and y <= ev.y <= y + h:
                 if i == self.sel:

@@ -46,11 +46,20 @@ pick() {
   if [[ -s $FAVS ]]; then
     while IFS= read -r f; do
       [[ -n $f ]] || continue
-      while IFS= read -r -d '' m; do list+=("$m"); done < <(find -L "$POOL" -maxdepth 3 -type f -name "$f" -print0)
+      if [[ $f == /* ]]; then                # full path (any source: collection or theme)
+        [[ -f $f ]] && list+=("$f")
+        continue
+      fi
+      [[ -d $POOL ]] && while IFS= read -r -d '' m; do list+=("$m"); done < <(find -L "$POOL" -maxdepth 3 -type f -name "$f" -print0)
     done <"$FAVS"
   fi
   if ((${#list[@]} == 0)); then
-    while IFS= read -r -d '' f; do list+=("$f"); done < <(find -L "$POOL" -mindepth 1 -maxdepth 3 -name '.*' -prune -o -type f -print0)
+    [[ -d $POOL ]] && while IFS= read -r -d '' f; do list+=("$f"); done < <(find -L "$POOL" -mindepth 1 -maxdepth 3 -name '.*' -prune -o -type f -print0)
+    if ((${#list[@]} == 0)); then           # no collection: rotate through the current theme's backgrounds
+      for d in "$HOME/.local/state/omarchy/current/theme/backgrounds" "$HOME/.config/omarchy/current/theme/backgrounds"; do
+        [[ -d $d ]] && while IFS= read -r -d '' f; do list+=("$f"); done < <(find -L "$d" -maxdepth 1 -type f -print0)
+      done
+    fi
   fi
   # images only (videos need the picker), and not the current one
   local imgs=()
