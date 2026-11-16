@@ -1,5 +1,9 @@
 # omarchy-hilm
 
+[![Release](https://img.shields.io/github/v/release/Dagmawi-M/omarchy-hilm?style=flat-square)](https://github.com/Dagmawi-M/omarchy-hilm/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+![Omarchy 3 & 4](https://img.shields.io/badge/omarchy-3.x%20%7C%204.x-orange?style=flat-square)
+
 ```
      ▄█▄▄
       █████████                █████          ▄▄███████████████████▄
@@ -131,6 +135,10 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 ```
 
 This removes the scripts, the shortcut, the thumbnail cache and the auto-rotate timer. Your wallpapers, favourites and settings are kept.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) or the [releases](https://github.com/Dagmawi-M/omarchy-hilm/releases).
 
 ## License
 
