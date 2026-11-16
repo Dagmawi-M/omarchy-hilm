@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Generate an omarchy theme from a wallpaper's colors.
+
+omarchy already renders every app's config from a theme's colors.toml, so all
+this has to do is produce a good colors.toml and hand off to omarchy-theme-set.
+
+Terminal ANSI slots are anchored to their canonical hues and only tinted toward
+the wallpaper - a "red" that isn't red makes a terminal unreadable.
+"""
+import colorsys
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+THEME_NAME = "hilm"
+OWNER_MARK = ".made-by-omarchy-hilm"  # we only ever touch a theme dir carrying this
+THEME_DIR = HOME / ".config/omarchy/themes" / THEME_NAME
+
+# Canonical hue anchors for ANSI slots 1-6 (red, green, yellow, blue, magenta, cyan)
+ANCHORS = [0.00, 0.33, 0.13, 0.60, 0.83, 0.50]
+TINT = 0.18  # how far ANSI hues drift toward the wallpaper's accent
+
+
+def rgb_to_hex(r, g, b):
+    return "#%02x%02x%02x" % (
+        max(0, min(255, round(r))), max(0, min(255, round(g))), max(0, min(255, round(b)))
+    )
+
+
+def hls_hex(h, l, s):
+    r, g, b = colorsys.hls_to_rgb(h % 1.0, max(0.0, min(1.0, l)), max(0.0, min(1.0, s)))
+    return rgb_to_hex(r * 255, g * 255, b * 255)
+
+
+def extract(image, n=16):
+    """Quantized palette as (hue, lightness, saturation, pixel_count)."""
+    out = subprocess.run(
+        ["magick", str(image), "-resize", "400x400>", "-colors", str(n),
+         "-format", "%c", "histogram:info:-"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    cols = []
+    for line in out.splitlines():
+        line = line.strip()
+        if "#" not in line or ":" not in line:
+            continue
+        count = int(line.split(":")[0])
+        hexv = line.split("#")[1].split()[0][:6]
+        r, g, b = (int(hexv[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        h, l, s = colorsys.rgb_to_hls(r, g, b)
+        cols.append((h, l, s, count))
+    return cols
+
+
+def build(image):
+    cols = extract(image)
+    if not cols:
+        raise SystemExit("could not read any colors from the image")
+
+    total = sum(c[3] for c in cols)
+    # Accent: the most "present" saturated colour, weighted by area and vividness.
+    cands = [c for c in cols if c[2] > 0.12 and 0.15 < c[1] < 0.85] or cols
+    accent_h, _, accent_s, _ = max(cands, key=lambda c: c[2] * (c[3] / total) ** 0.4)
+    accent_s = max(0.35, min(0.75, accent_s))
+
+    # Overall image lightness decides whether we build a dark or light theme.
+    mean_l = sum(c[1] * c[3] for c in cols) / total
+    dark = mean_l < 0.55
+
+    if dark:
+        bg_l, fg_l = 0.07, 0.85
+    else:
+        bg_l, fg_l = 0.93, 0.15
+
+    bg = hls_hex(accent_h, bg_l, 0.10)
+    fg = hls_hex(accent_h, fg_l, 0.06)
+    accent = hls_hex(accent_h, 0.55 if dark else 0.42, accent_s)
+
+    c = {
+        "accent": accent,
+        "active_border_color": hls_hex(accent_h, 0.68 if dark else 0.50, accent_s * 0.8),
+        "active_tab_background": accent,
+        "cursor": fg,
+        "foreground": fg,
+        "background": bg,
+        "selection_foreground": bg,
+        "selection_background": accent,
+    }
+
+    # ANSI 0-7 (normal) and 8-15 (bright)
+    c["color0"] = bg
+    c["color7"] = hls_hex(accent_h, 0.78 if dark else 0.28, 0.05)
+    c["color8"] = hls_hex(accent_h, 0.32, 0.08)
+    c["color15"] = hls_hex(accent_h, 0.92 if dark else 0.12, 0.04)
+    for i, anchor in enumerate(ANCHORS, start=1):
+        # Rotate the anchor slightly toward the accent hue, along the short arc.
+        delta = ((accent_h - anchor + 0.5) % 1.0) - 0.5
+        h = anchor + delta * TINT
+        c[f"color{i}"] = hls_hex(h, 0.58 if dark else 0.40, 0.55)
+        c[f"color{i + 8}"] = hls_hex(h, 0.70 if dark else 0.52, 0.62)
+    return c, dark
+
+
+OMARCHY_PATH = Path(os.environ.get("OMARCHY_PATH") or HOME / ".local/share/omarchy")
+# Files Omarchy reads from a theme that are NOT generated from colors.toml.
+# Borrowed from a built-in theme of the same light/dark mode so nothing dangles
+# (e.g. Omarchy's nvim config symlinks current/theme/neovim.lua).
+DONOR_FILES = ("neovim.lua", "vscode.json", "icons.theme")
+DONOR_PREF = {
+    True: ["tokyo-night", "catppuccin", "kanagawa", "gruvbox", "everforest", "nord", "osaka-jade"],
+    False: ["catppuccin-latte", "rose-pine", "flexoki-light"],
+}
+
+
+def donor_theme(dark):
+    themes = OMARCHY_PATH / "themes"
+    if not themes.is_dir():
+        return None
+    names = DONOR_PREF[dark] + sorted(p.name for p in themes.iterdir())
+    for n in names:
+        d = themes / n
+        if d.is_dir() and (d / "light.mode").exists() != dark and any((d / f).exists() for f in DONOR_FILES):
+            return d
+    return None
+
+
+def fill_unknown_keys(colors):
+    """Future-proofing: if this Omarchy's templates use a colour key we don't
+    generate, derive it so no template is left with a raw {{ placeholder }}."""
+    keys = set()
+    for d in (OMARCHY_PATH / "default/themed", HOME / ".config/omarchy/themed"):
+        if d.is_dir():
+            for tpl in d.glob("*.tpl"):
+                try:
+                    keys |= set(re.findall(r"\{\{\s*([a-z0-9_]+)\s*\}\}", tpl.read_text(errors="ignore")))
+                except OSError:
+                    pass
+    extra = {}
+    for k in keys:
+        base = re.sub(r"_(rgb|strip)$", "", k)
+        if base in colors or base in extra:
+            continue
+        if "background" in base or base.endswith("_bg"):
+            extra[base] = colors["background"]
+        elif "foreground" in base or "text" in base or base.endswith("_fg"):
+            extra[base] = colors["foreground"]
+        else:
+            extra[base] = colors["accent"]
+    return extra
+
+
+def write_theme(colors, image, dark):
+    if THEME_DIR.exists() and not (THEME_DIR / OWNER_MARK).exists():
+        raise SystemExit(f"refusing to overwrite {THEME_DIR}: it was not created by "
+                         "omarchy-hilm. Rename or remove it and try again.")
+    (THEME_DIR / "backgrounds").mkdir(parents=True, exist_ok=True)
+    (THEME_DIR / OWNER_MARK).touch()
+    # Only colors.toml + backgrounds may live here: any other file would shadow
+    # omarchy's generated templates.
+    for stale in THEME_DIR.iterdir():
+        if stale.name not in ("colors.toml", "backgrounds", OWNER_MARK, "light.mode") + DONOR_FILES:
+            stale.unlink() if stale.is_file() else None
+
+    bgdir = THEME_DIR / "backgrounds"
+    for old in bgdir.iterdir():
+        old.unlink()
+    link = bgdir / Path(image).name
+    os.symlink(os.path.abspath(image), link)
+
+    order = ["accent", "active_border_color", "active_tab_background", "cursor",
+             "foreground", "background", "selection_foreground", "selection_background"]
+    lines = [f"# Generated by omarchy-hilm-theme from {Path(image).name}",
+             f"# mode: {'dark' if dark else 'light'}", ""]
+    for k in order:
+        lines.append(f'{k} = "{colors[k]}"')
+    lines.append("")
+    for i in range(16):
+        lines.append(f'color{i} = "{colors[f"color{i}"]}"')
+    extra = fill_unknown_keys(colors)
+    if extra:
+        lines.append("")
+        lines.append("# derived for newer Omarchy templates")
+        for k, v in sorted(extra.items()):
+            lines.append(f'{k} = "{v}"')
+    (THEME_DIR / "colors.toml").write_text("\n".join(lines) + "\n")
+
+    donor = donor_theme(dark)
+    for f in DONOR_FILES:
+        (THEME_DIR / f).unlink(missing_ok=True)
+        if donor and (donor / f).is_file():
+            shutil.copy2(donor / f, THEME_DIR / f)
+
+    # omarchy's light/dark switch reads this marker
+    (THEME_DIR / "light.mode").unlink(missing_ok=True)
+    if not dark:
+        (THEME_DIR / "light.mode").touch()
+
+
+def set_wallpaper_only(image):
+    link = HOME / ".config/omarchy/current/background"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    os.symlink(os.path.abspath(image), link)
+    subprocess.run(["pkill", "-x", "swaybg"])
+    subprocess.Popen(["setsid", "swaybg", "-i", str(link), "-m", "fill"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        image = args[0]
+    else:
+        image = os.path.realpath(HOME / ".config/omarchy/current/background")
+    if not os.path.isfile(image):
+        raise SystemExit(f"no such image: {image}")
+
+    # Older omarchy (no colors.toml templating): just swap the wallpaper.
+    if not shutil.which("omarchy-theme-set-templates") or "--wallpaper-only" in sys.argv:
+        set_wallpaper_only(image)
+        print(f"wallpaper set to {Path(image).name} (theme templating not available)")
+        return
+
+    colors, dark = build(image)
+    write_theme(colors, image, dark)
+    print(f"theme '{THEME_NAME}' generated from {Path(image).name} "
+          f"({'dark' if dark else 'light'}, accent {colors['accent']})")
+
+    if "--no-apply" not in sys.argv:
+        subprocess.run(["omarchy-theme-set", THEME_NAME], check=False)
+
+
+if __name__ == "__main__":
+    main()

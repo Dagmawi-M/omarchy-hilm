@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Auto-rotate wallpapers (favourites first, else whole pool) via a systemd user timer.
+#   omarchy-hilm-rotate on|off|status|next|interval <minutes>
+set -euo pipefail
+
+CONF_DIR="$HOME/.config/omarchy-hilm"
+POOL="$HOME/.config/omarchy/wallpapers"
+[[ -f $CONF_DIR/config ]] && { d=$(grep -oP '^WALLPAPER_DIR="?\K[^"]*' "$CONF_DIR/config" || true); [[ -n $d ]] && POOL="${d/#\~/$HOME}"; }
+FAVS="$CONF_DIR/favorites"
+HIDDEN="$CONF_DIR/hidden"
+CONF="$CONF_DIR/rotate.conf"
+UNIT_DIR="$HOME/.config/systemd/user"
+NAME="omarchy-hilm-rotate"
+
+interval() { [[ -f $CONF ]] && grep -oP '^INTERVAL=\K[0-9]+' "$CONF" || echo 30; }
+
+write_units() {
+  local m; m=$(interval)
+  mkdir -p "$UNIT_DIR"
+  cat >"$UNIT_DIR/$NAME.service" <<EOF
+[Unit]
+Description=Rotate omarchy wallpaper
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/$NAME next
+EOF
+  cat >"$UNIT_DIR/$NAME.timer" <<EOF
+[Unit]
+Description=Rotate omarchy wallpaper every ${m} minutes
+
+[Timer]
+OnActiveSec=${m}min
+OnUnitActiveSec=${m}min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+}
+
+pick() {
+  local cur list=()
+  cur=$(realpath "$HOME/.config/omarchy/current/background" 2>/dev/null || true)
+  if [[ -s $FAVS ]]; then
+    while IFS= read -r f; do
+      [[ -n $f ]] || continue
+      while IFS= read -r -d '' m; do list+=("$m"); done < <(find "$POOL" -maxdepth 3 -type f -name "$f" -print0)
+    done <"$FAVS"
+  fi
+  if ((${#list[@]} == 0)); then
+    while IFS= read -r -d '' f; do list+=("$f"); done < <(find "$POOL" -mindepth 1 -maxdepth 3 -name '.*' -prune -o -type f -print0)
+  fi
+  # images only (videos need the picker), and not the current one
+  local imgs=()
+  for f in "${list[@]}"; do
+    [[ -f $HIDDEN ]] && grep -qxF "$f" "$HIDDEN" && continue
+    [[ ${f,,} =~ \.(png|jpe?g|webp|bmp)$ ]] && [[ $(realpath "$f") != "$cur" ]] && imgs+=("$f")
+  done
+  ((${#imgs[@]})) || exit 0
+  printf '%s\n' "${imgs[RANDOM % ${#imgs[@]}]}"
+}
+
+case "${1:-status}" in
+  on)   write_units; systemctl --user enable --now "$NAME.timer" >/dev/null 2>&1; echo "on $(interval)m" ;;
+  off)  systemctl --user disable --now "$NAME.timer" >/dev/null 2>&1 || true; echo off ;;
+  status)
+    if systemctl --user is-active --quiet "$NAME.timer" 2>/dev/null; then echo "on $(interval)m"; else echo off; fi ;;
+  next)
+    img=$(pick); [[ -n $img ]] || exit 0
+    pkill -x mpvpaper || true
+    rm -f "$HOME/.cache/omarchy-hilm/active-video"
+    omarchy-hilm-theme "$img" ;;
+  interval)
+    [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "usage: $0 interval <minutes>"; exit 1; }
+    mkdir -p "$(dirname "$CONF")"; echo "INTERVAL=$2" >"$CONF"
+    if systemctl --user is-active --quiet "$NAME.timer"; then write_units; systemctl --user restart "$NAME.timer"; fi
+    echo "interval ${2}m" ;;
+  *) echo "usage: $0 on|off|status|next|interval <min>"; exit 1 ;;
+esac

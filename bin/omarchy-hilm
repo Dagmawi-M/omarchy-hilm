@@ -1,0 +1,967 @@
+#!/usr/bin/env python3
+"""omarchy-hilm: futuristic carousel wallpaper picker (layer-shell overlay).
+
+Cover-flow of holographic cards over a LIVE preview of the focused
+wallpaper, tinted with the current omarchy theme accent.
+
+Keys:  ←/→ h/l, scroll   navigate        Enter/Space  apply
+       /  then type      search          f            favourite
+       r                 random spin     t            toggle auto-rotate
+       Del/x (twice)     hide (file is kept)          o            import from file
+       Home/End          jump            Esc/q        cancel (restores)
+Mouse: click side card to focus, click center card to apply, right-click exits.
+"""
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, GtkLayerShell
+
+import cairo
+import colorsys
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONF_DIR = HOME / ".config/omarchy-hilm"
+CONF_FILE = CONF_DIR / "config"
+HIDDEN = CONF_DIR / "hidden"
+
+
+def read_pool():
+    """Wallpaper folder chosen in the installer (config file), else Omarchy's."""
+    try:
+        m = re.search(r'^WALLPAPER_DIR="?(.*?)"?\s*$', CONF_FILE.read_text(), re.M)
+        if m and m.group(1):
+            return Path(os.path.expanduser(m.group(1)))
+    except OSError:
+        pass
+    return HOME / ".config/omarchy/wallpapers"
+
+
+POOL = read_pool()
+CURRENT = HOME / ".config/omarchy/current/background"
+COLORS = HOME / ".config/omarchy/current/theme/colors.toml"
+FAVS = CONF_DIR / "favorites"
+CACHE = HOME / ".cache/omarchy-hilm"
+ACTIVE_VIDEO = CACHE / "active-video"
+THEME_CMD = "omarchy-hilm-theme"
+ROTATE_CMD = "omarchy-hilm-rotate"
+
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+VIDEO_EXT = {".mp4", ".webm", ".mkv", ".mov", ".gif"}
+
+CARD_W, CARD_H = 560, 330
+RADIUS = 14
+SPACING = 300
+FONT = "JetBrainsMono Nerd Font"
+IMPORT = object()
+VERSION = "1.0.0"
+
+
+# ---------------------------------------------------------------- helpers
+def load_accent():
+    try:
+        m = re.search(r'^accent\s*=\s*"#([0-9a-fA-F]{6})"', COLORS.read_text(), re.M)
+        r, g, b = (int(m.group(1)[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except Exception:
+        r, g, b = 0.37, 0.94, 1.0
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    a1 = colorsys.hls_to_rgb(h, max(l, 0.62), max(s, 0.75))          # neon-ify
+    a2 = colorsys.hls_to_rgb((h + 0.14) % 1, max(l, 0.62), max(s, 0.75))
+    return a1, a2
+
+
+ACCENT, ACCENT2 = load_accent()
+
+
+def is_video(p):
+    return p.suffix.lower() in VIDEO_EXT
+
+
+def current_path():
+    try:
+        return os.path.realpath(CURRENT)
+    except OSError:
+        return None
+
+
+def active_video():
+    try:
+        v = ACTIVE_VIDEO.read_text().strip()
+        if v and subprocess.run(["pgrep", "-x", "mpvpaper"], capture_output=True).returncode == 0:
+            return v
+    except OSError:
+        pass
+    return None
+
+
+def load_favs():
+    try:
+        return {l.strip() for l in FAVS.read_text().splitlines() if l.strip()}
+    except OSError:
+        return set()
+
+
+def save_favs(favs):
+    FAVS.parent.mkdir(parents=True, exist_ok=True)
+    FAVS.write_text("\n".join(sorted(favs)) + "\n")
+
+
+def load_hidden():
+    try:
+        return {l.strip() for l in HIDDEN.read_text().splitlines() if l.strip()}
+    except OSError:
+        return set()
+
+
+def hide(path):
+    """Non-destructive 'remove': the file stays on disk, the picker just skips it."""
+    HIDDEN.parent.mkdir(parents=True, exist_ok=True)
+    with HIDDEN.open("a") as f:
+        f.write(str(path) + "\n")
+
+
+def scan_pool():
+    """Images/videos in the pool and its subfolders (2 levels deep), skipping hidden ones."""
+    if not POOL.is_dir():
+        return []
+    hidden, out = load_hidden(), []
+    exts = IMAGE_EXT | VIDEO_EXT
+    for root, dirs, files in os.walk(POOL):
+        depth = Path(root).relative_to(POOL).parts
+        dirs[:] = [d for d in dirs if not d.startswith(".")] if len(depth) < 2 else []
+        for f in files:
+            p = Path(root) / f
+            if p.suffix.lower() in exts and not f.startswith(".") and str(p) not in hidden:
+                out.append(p)
+            if len(out) >= 1000:
+                return out
+    return out
+
+
+def cache_key(path):
+    st = path.stat()
+    return hashlib.sha1(f"{path}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:16]
+
+
+def palette_of(pb, n=5):
+    """Dominant colours via coarse bucketing of a tiny pixbuf."""
+    small = pb.scale_simple(40, 24, GdkPixbuf.InterpType.BILINEAR)
+    px, rs, nc = small.get_pixels(), small.get_rowstride(), small.get_n_channels()
+    buckets = {}
+    for y in range(small.get_height()):
+        for x in range(small.get_width()):
+            o = y * rs + x * nc
+            r, g, b = px[o], px[o + 1], px[o + 2]
+            k = (r >> 6, g >> 6, b >> 6)
+            e = buckets.setdefault(k, [0, 0, 0, 0])
+            e[0] += r; e[1] += g; e[2] += b; e[3] += 1
+    cols = []
+    for r, g, b, c in buckets.values():
+        rgb = (r / c / 255, g / c / 255, b / c / 255)
+        s = colorsys.rgb_to_hls(*rgb)[2]
+        cols.append((c * (0.5 + s), rgb))
+    cols.sort(key=lambda t: -t[0])
+    out = [rgb for _, rgb in cols[:n]]
+    out.sort(key=lambda c: colorsys.rgb_to_hls(*c)[1])
+    return out
+
+
+def video_frame(path, out):
+    if not out.exists():
+        subprocess.run(["ffmpegthumbnailer", "-i", str(path), "-o", str(out),
+                        "-s", "1280", "-t", "15%", "-c", "png"],
+                       capture_output=True, timeout=20)
+    return out if out.exists() else None
+
+
+def build_cache(path):
+    """Returns (thumb_pixbuf, blur_pixbuf, meta) from disk cache, building it if needed."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    key = cache_key(path)
+    tp, mp = CACHE / f"{key}.png", CACHE / f"{key}.json"
+    if tp.exists() and mp.exists():
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file(str(tp)), json.loads(mp.read_text())
+        except Exception:
+            pass
+    src_file = path
+    if is_video(path):
+        src_file = video_frame(path, CACHE / f"{key}.frame.png")
+        if src_file is None:
+            return None, {"res": "", "palette": [], "frame": None}
+    info = GdkPixbuf.Pixbuf.get_file_info(str(src_file))
+    res = f"{info[1]}×{info[2]}" if info and info[0] else ""
+    src = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(src_file), CARD_W * 2, -1, True)
+    sw, sh = src.get_width(), src.get_height()
+    s = max(CARD_W / sw, CARD_H / sh)
+    nw, nh = max(1, round(sw * s)), max(1, round(sh * s))
+    sc = src.scale_simple(nw, nh, GdkPixbuf.InterpType.HYPER)
+    thumb = sc.new_subpixbuf((nw - CARD_W) // 2, (nh - CARD_H) // 2, CARD_W, CARD_H).copy()
+    meta = {"res": res, "palette": palette_of(src),
+            "frame": str(src_file) if is_video(path) else None}
+    thumb.savev(str(tp), "png", [], [])
+    mp.write_text(json.dumps(meta))
+    return thumb, meta
+
+
+def rrect(ctx, x, y, w, h, r):
+    ctx.new_sub_path()
+    ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
+
+
+def ease(t):
+    return 1 - (1 - t) ** 3
+
+
+def ease_spin(t):
+    return 1 - (1 - t) ** 5
+
+
+def bg_launch(image):
+    """Swap swaybg to `image` without a black gap: start new, then kill old."""
+    old = subprocess.run(["pgrep", "-x", "swaybg"], capture_output=True, text=True).stdout.split()
+    subprocess.Popen(["setsid", "swaybg", "-i", str(image), "-m", "fill"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if old:
+        GLib.timeout_add(250, lambda: [subprocess.run(["kill", *old]), False][1])
+
+
+def rotate_status():
+    try:
+        out = subprocess.run([ROTATE_CMD, "status"], capture_output=True, text=True, timeout=2).stdout.strip()
+        return out
+    except Exception:
+        return "off"
+
+
+# ---------------------------------------------------------------- picker
+class Picker:
+    def __init__(self):
+        self.win = Gtk.Window()
+        self.win.set_decorated(False)
+        self.win.set_app_paintable(True)
+        visual = self.win.get_screen().get_rgba_visual()
+        if visual:
+            self.win.set_visual(visual)
+
+        GtkLayerShell.init_for_window(self.win)
+        GtkLayerShell.set_layer(self.win, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self.win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        for e in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                  GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+            GtkLayerShell.set_anchor(self.win, e, True)
+
+        self.area = Gtk.DrawingArea()
+        self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.SCROLL_MASK
+                             | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self.area.connect("draw", self.on_draw)
+        self.area.connect("button-press-event", self.on_click)
+        self.area.connect("scroll-event", self.on_scroll)
+        self.win.add(self.area)
+        self.win.connect("key-press-event", self.on_key)
+        self.win.connect("destroy", self.on_destroy)
+
+        self.cache = {}
+        self.hits = []
+        self.confirm_del = None
+        self.search = None          # None = not searching, str = query
+        self.toast = ("", 0.0)
+        self.favs = load_favs()
+        self.applied = False
+        self.previewing = None
+        self.orig_video = active_video()
+        self.rotate = rotate_status()
+        self.t0 = time.monotonic()
+        self.switch_t = -10.0
+        self.anim_dur = 0.32
+        self.anim_ease = ease
+        self.preview_src = None
+
+        self.load_items()
+        self.pos = self.anim_from = float(self.sel)
+        self.anim_start = 0.0
+        GLib.timeout_add(16, self.tick)
+        GLib.idle_add(self.prefetch)
+        # put the old wallpaper back if we're killed mid-preview
+        for sig in (2, 15, 1):  # SIGINT, SIGTERM, SIGHUP
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self.on_signal)
+        self.win.show_all()
+
+    def on_signal(self):
+        self.win.close()
+        return False
+
+    # ---------- data ----------
+    def load_items(self, keep=None):
+        walls = scan_pool()
+        walls.sort(key=lambda p: (p.name not in self.favs, p.name.lower()))
+        self.items = walls + [IMPORT]
+        cur, vid = current_path(), active_video()
+        self.sel = 0
+        for i, w in enumerate(walls):
+            if keep is not None:
+                if w == keep:
+                    self.sel = i
+            elif (vid and str(w) == vid) or (not vid and cur and os.path.realpath(w) == cur):
+                self.sel = i
+
+    def is_active(self, item):
+        vid = self.orig_video
+        if vid:
+            return str(item) == vid
+        cur = current_path()
+        return bool(cur) and os.path.realpath(item) == cur
+
+    def entry(self, item):
+        if item not in self.cache:
+            try:
+                thumb, meta = build_cache(item)
+            except Exception:
+                thumb, meta = None, {"res": "", "palette": [], "frame": None}
+            blur = thumb.scale_simple(24, 14, GdkPixbuf.InterpType.BILINEAR) if thumb else None
+            self.cache[item] = (thumb, blur, meta)
+        return self.cache[item]
+
+    def prefetch(self):
+        # warm the cache outward from the selection, one per idle
+        order = sorted(range(len(self.items) - 1), key=lambda i: abs(i - self.sel))
+        for i in order:
+            if self.items[i] not in self.cache:
+                self.entry(self.items[i])
+                return True
+        return False
+
+    # ---------- motion ----------
+    def go(self, idx, dur=0.32, fn=ease):
+        idx = max(0, min(len(self.items) - 1, idx))
+        if idx == self.sel:
+            return
+        self.confirm_del = None
+        self.anim_from = self.pos
+        self.anim_start = time.monotonic()
+        self.anim_dur, self.anim_ease = dur, fn
+        self.sel = idx
+        self.switch_t = time.monotonic() - self.t0 + dur * 0.6
+        if self.preview_src:
+            GLib.source_remove(self.preview_src)
+        self.preview_src = GLib.timeout_add(int(dur * 1000) + 120, self.do_preview)
+
+    def tick(self):
+        t = min(1.0, (time.monotonic() - self.anim_start) / self.anim_dur)
+        self.pos = self.anim_from + (self.sel - self.anim_from) * self.anim_ease(t)
+        self.area.queue_draw()
+        return True
+
+    # ---------- live preview ----------
+    def do_preview(self):
+        self.preview_src = None
+        item = self.items[self.sel]
+        if item is IMPORT or self.applied:
+            return False
+        target = item
+        if is_video(item):
+            target = self.entry(item)[2].get("frame")
+            if not target:
+                return False
+        if self.previewing == str(target):
+            return False
+        if self.previewing is None and self.orig_video:
+            subprocess.run(["pkill", "-x", "mpvpaper"])
+        self.previewing = str(target)
+        bg_launch(target)
+        return False
+
+    def restore(self):
+        if self.previewing is None:
+            return
+        if self.orig_video:
+            subprocess.run(["pkill", "-x", "swaybg"])
+            launch_video(self.orig_video)
+        else:
+            bg_launch(CURRENT)
+
+    def on_destroy(self, *_):
+        if not self.applied:
+            self.restore()
+        Gtk.main_quit()
+
+    # ---------- drawing ----------
+    def on_draw(self, w, ctx):
+        W, H = w.get_allocated_width(), w.get_allocated_height()
+        now = time.monotonic() - self.t0
+        intro = ease(min(1.0, now / 0.45))
+        self.hits = []
+
+        # translucent backdrop: real (previewed) wallpaper shows through
+        ctx.set_source_rgba(0.02, 0.03, 0.06, 0.42 * intro)
+        ctx.paint()
+
+        # perspective grid floor
+        horizon = H * 0.5 + CARD_H * 0.5 + 40
+        ctx.set_line_width(1)
+        for i in range(-24, 25):
+            ctx.move_to(W / 2 + i * 22, horizon)
+            ctx.line_to(W / 2 + i * 260, H)
+        for k in range(1, 14):
+            y = horizon + (H - horizon) * ((k + (now * 0.6) % 1) / 14) ** 2
+            ctx.move_to(0, y)
+            ctx.line_to(W, y)
+        g = cairo.LinearGradient(0, horizon, 0, H)
+        g.add_color_stop_rgba(0, *ACCENT, 0.0)
+        g.add_color_stop_rgba(1, *ACCENT, 0.22 * intro)
+        ctx.set_source(g)
+        ctx.stroke()
+
+        v = cairo.RadialGradient(W / 2, H / 2, min(W, H) * 0.3, W / 2, H / 2, max(W, H) * 0.75)
+        v.add_color_stop_rgba(0, 0, 0, 0, 0)
+        v.add_color_stop_rgba(1, 0, 0, 0, 0.7 * intro)
+        ctx.set_source(v)
+        ctx.paint()
+
+        cx, cy = W / 2, H / 2 - 10
+        for i in sorted(range(len(self.items)), key=lambda i: -abs(i - self.pos)):
+            if abs(i - self.pos) <= 4.2:
+                # staggered fly-in: farther cards arrive later
+                ci = ease(max(0.0, min(1.0, (now - 0.06 * abs(i - self.sel)) / 0.5)))
+                self.draw_card(ctx, i, i - self.pos, cx, cy, ci, now)
+
+        self.draw_hud(ctx, W, H, intro, now)
+        return False
+
+    def draw_card(self, ctx, i, d, cx, cy, intro, now):
+        ad = abs(d)
+        sgn = 1 if d >= 0 else -1
+        near = min(ad, 1.0)
+        x_off = sgn * (SPACING * near + max(0.0, ad - 1) * 150)
+        x_off += sgn * (1 - intro) * 400                 # fly in from the sides
+        scale = 1.0 - 0.28 * near - 0.08 * max(0.0, ad - 1)
+        squash = 1.0 - 0.38 * near
+        shear = -sgn * 0.13 * near
+        alpha = max(0.0, min(1.0, 4.2 - ad)) * intro
+        lift = (1 - intro) * 80
+
+        w, h = CARD_W * scale, CARD_H * scale
+        ctx.save()
+        ctx.translate(cx + x_off, cy + lift)
+        ctx.transform(cairo.Matrix(squash, shear, 0, 1, 0, 0))
+        x, y = -w / 2, -h / 2
+        focused = ad < 0.5
+        item = self.items[i]
+        thumb, _, meta = (None, None, {}) if item is IMPORT else self.entry(item)
+
+        # reflection
+        if thumb is not None and ad < 3:
+            ctx.save()
+            ctx.translate(0, h + 8)
+            ctx.scale(1, -1)
+            rrect(ctx, x, y, w, h, RADIUS * scale)
+            ctx.clip()
+            ctx.translate(x, y)
+            ctx.scale(w / CARD_W, h / CARD_H)
+            Gdk.cairo_set_source_pixbuf(ctx, thumb, 0, 0)
+            m = cairo.LinearGradient(0, CARD_H * 0.55, 0, CARD_H)
+            m.add_color_stop_rgba(0, 0, 0, 0, 0)
+            m.add_color_stop_rgba(1, 0, 0, 0, 0.22 * alpha)
+            ctx.mask(m)
+            ctx.restore()
+
+        if focused:
+            pulse = 0.75 + 0.25 * math.sin(now * 2.4)
+            for k in range(6, 0, -1):
+                rrect(ctx, x - k * 4, y - k * 4, w + k * 8, h + k * 8, RADIUS + k * 4)
+                ctx.set_source_rgba(*ACCENT, 0.035 * pulse * alpha)
+                ctx.fill()
+
+        # body
+        rrect(ctx, x, y, w, h, RADIUS * scale)
+        ctx.save()
+        ctx.clip()
+        if item is IMPORT:
+            g = cairo.LinearGradient(x, y, x + w, y + h)
+            g.add_color_stop_rgba(0, 0.08, 0.10, 0.16, alpha)
+            g.add_color_stop_rgba(1, 0.04, 0.05, 0.09, alpha)
+            ctx.set_source(g)
+            ctx.paint()
+        else:
+            if thumb is not None:
+                ctx.save()
+                ctx.translate(x, y)
+                ctx.scale(w / CARD_W, h / CARD_H)
+                Gdk.cairo_set_source_pixbuf(ctx, thumb, 0, 0)
+                ctx.paint_with_alpha(alpha)
+                ctx.restore()
+            else:
+                ctx.set_source_rgba(0.08, 0.09, 0.13, alpha)
+                ctx.paint()
+            ctx.set_source_rgba(0.01, 0.02, 0.05, (0.55 * near + 0.1 * max(0, ad - 1)) * alpha)
+            ctx.paint()
+            if focused:
+                sx = x + ((now * 0.35) % 1.6 - 0.3) * w
+                sh = cairo.LinearGradient(sx - 120, y, sx + 120, y + h)
+                sh.add_color_stop_rgba(0, 1, 1, 1, 0)
+                sh.add_color_stop_rgba(0.5, 1, 1, 1, 0.10 * alpha)
+                sh.add_color_stop_rgba(1, 1, 1, 1, 0)
+                ctx.set_source(sh)
+                ctx.paint()
+                self.draw_glitch(ctx, x, y, w, h, now, alpha)
+            ctx.set_source_rgba(0, 0, 0, 0.10 * alpha)
+            yy = y
+            while yy < y + h:
+                ctx.rectangle(x, yy, w, 1)
+                yy += 3
+            ctx.fill()
+            sc = cairo.LinearGradient(0, y + h * 0.5, 0, y + h)
+            sc.add_color_stop_rgba(0, 0, 0, 0, 0)
+            sc.add_color_stop_rgba(1, 0, 0, 0, 0.8 * alpha)
+            ctx.set_source(sc)
+            ctx.paint()
+        ctx.restore()
+
+        # border
+        rrect(ctx, x, y, w, h, RADIUS * scale)
+        if focused:
+            bg = cairo.LinearGradient(x, y, x + w, y + h)
+            bg.add_color_stop_rgba(0, *ACCENT, alpha)
+            bg.add_color_stop_rgba(1, *ACCENT2, alpha)
+            ctx.set_source(bg)
+            ctx.set_line_width(2)
+        else:
+            ctx.set_source_rgba(1, 1, 1, 0.14 * alpha)
+            ctx.set_line_width(1)
+            if item is IMPORT:
+                ctx.set_dash([8, 6])
+        ctx.stroke()
+        ctx.set_dash([])
+        if focused:
+            self.draw_brackets(ctx, x, y, w, h, alpha, now)
+
+        # text & badges
+        ctx.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        if item is IMPORT:
+            ctx.set_source_rgba(*ACCENT, 0.9 * alpha)
+            ctx.set_font_size(54 * scale)
+            self.center_text(ctx, "+", 0, -8 * scale)
+            ctx.set_font_size(14 * scale)
+            ctx.set_source_rgba(0.85, 0.9, 1, 0.8 * alpha)
+            self.center_text(ctx, "IMPORT FROM FILE", 0, 36 * scale)
+        else:
+            ctx.set_font_size(11 * scale)
+            ctx.set_source_rgba(*ACCENT, 0.9 * alpha)
+            ctx.move_to(x + 16 * scale, y + h - 34 * scale)
+            ctx.show_text(f"#{i + 1:02d}")
+            ctx.set_font_size(17 * scale)
+            ctx.set_source_rgba(0.96, 0.97, 1, alpha)
+            ctx.move_to(x + 16 * scale, y + h - 14 * scale)
+            name = item.stem.upper()
+            ctx.show_text(name if len(name) <= 26 else name[:25] + "…")
+
+            # palette swatches (bottom-right)
+            pal = meta.get("palette") or []
+            sw = 16 * scale
+            px0 = x + w - 16 * scale - len(pal) * (sw + 4 * scale)
+            for k, c in enumerate(pal):
+                rrect(ctx, px0 + k * (sw + 4 * scale), y + h - 30 * scale, sw, sw, 4 * scale)
+                ctx.set_source_rgba(*c, alpha)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(1, 1, 1, 0.25 * alpha)
+                ctx.set_line_width(1)
+                ctx.stroke()
+
+            # chips (top)
+            chip_x = x + w - 14 * scale
+            if self.is_active(item):
+                chip_x = self.draw_chip(ctx, chip_x, y + 14 * scale, "● ACTIVE", scale, alpha) - 6 * scale
+            if is_video(item):
+                chip_x = self.draw_chip(ctx, chip_x, y + 14 * scale, "▶ LIVE", scale, alpha, ACCENT2) - 6 * scale
+            if item.name in self.favs:
+                ctx.set_font_size(20 * scale)
+                ctx.set_source_rgba(1, 0.82, 0.3, alpha)
+                ctx.move_to(x + 14 * scale, y + 32 * scale)
+                ctx.show_text("★")
+        ctx.restore()
+
+        sx0 = cx + x_off - w * squash / 2
+        self.hits.append((i, sx0, cy + y, w * squash, h))
+
+    def draw_glitch(self, ctx, x, y, w, h, now, alpha):
+        t = now - self.switch_t
+        if not (0 <= t < 0.28):
+            return
+        k = 1 - t / 0.28
+        rnd = random.Random(int(now * 40))
+        for _ in range(7):
+            gy = y + rnd.random() * h
+            gh = 2 + rnd.random() * 14
+            gx = (rnd.random() - 0.5) * 60 * k
+            ctx.rectangle(x + gx, gy, w, gh)
+            ctx.set_source_rgba(*(ACCENT if rnd.random() < 0.5 else ACCENT2), 0.35 * k * alpha)
+            ctx.fill()
+        ctx.set_source_rgba(1, 1, 1, 0.18 * k * alpha)
+        ctx.paint()
+
+    def draw_brackets(self, ctx, x, y, w, h, alpha, now):
+        L, o = 26, 10
+        gap = 2 * math.sin(now * 3)
+        ctx.set_line_width(2.5)
+        ctx.set_source_rgba(*ACCENT, alpha)
+        for (px, py, dx, dy) in ((x - o - gap, y - o - gap, 1, 1), (x + w + o + gap, y - o - gap, -1, 1),
+                                 (x - o - gap, y + h + o + gap, 1, -1), (x + w + o + gap, y + h + o + gap, -1, -1)):
+            ctx.move_to(px, py + dy * L)
+            ctx.line_to(px, py)
+            ctx.line_to(px + dx * L, py)
+        ctx.stroke()
+
+    def draw_chip(self, ctx, rx, ty, text, scale, alpha, color=None):
+        ctx.set_font_size(10 * scale)
+        ext = ctx.text_extents(text)
+        pw, ph = ext.x_advance + 16 * scale, 20 * scale
+        rrect(ctx, rx - pw, ty, pw, ph, ph / 2)
+        ctx.set_source_rgba(*(color or ACCENT), 0.92 * alpha)
+        ctx.fill()
+        ctx.set_source_rgba(0.02, 0.05, 0.1, alpha)
+        ctx.move_to(rx - pw + 8 * scale, ty + ph / 2 + ext.height / 2 - 1)
+        ctx.show_text(text)
+        return rx - pw
+
+    def center_text(self, ctx, text, x, y):
+        e = ctx.text_extents(text)
+        ctx.move_to(x - e.x_advance / 2, y + e.height / 2)
+        ctx.show_text(text)
+
+    def draw_hud(self, ctx, W, H, a, now):
+        ctx.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(12)
+        ctx.set_source_rgba(*ACCENT, 0.9 * a)
+        ctx.move_to(48, 56)
+        ctx.show_text("◢ HILM://WALLPAPER")
+        ctx.set_font_size(26)
+        ctx.set_source_rgba(0.96, 0.97, 1, a)
+        ctx.move_to(48, 90)
+        ctx.show_text("SELECT VISUAL")
+        ctx.set_line_width(1)
+        ctx.set_source_rgba(*ACCENT, 0.5 * a)
+        ctx.move_to(48, 104)
+        ctx.line_to(288, 104)
+        ctx.stroke()
+        # auto-rotate status
+        ctx.set_font_size(11)
+        on = self.rotate.startswith("on")
+        ctx.set_source_rgba(*(ACCENT if on else (1, 1, 1)), (0.9 if on else 0.35) * a)
+        ctx.move_to(48, 126)
+        ctx.show_text(f"AUTO-ROTATE: {self.rotate.upper()}")
+
+        if int(now * 2) % 2 == 0:
+            ctx.set_source_rgba(*ACCENT, a)
+            ctx.arc(36, 52, 3, 0, 2 * math.pi)
+            ctx.fill()
+
+        n = len(self.items) - 1
+        idx = f"{self.sel + 1:02d} / {n:02d}" if self.items[self.sel] is not IMPORT else f"++ / {n:02d}"
+        ctx.set_font_size(30)
+        e = ctx.text_extents(idx)
+        ctx.set_source_rgba(0.96, 0.97, 1, a)
+        ctx.move_to(W - 48 - e.x_advance, 90)
+        ctx.show_text(idx)
+        ctx.set_font_size(11)
+        lab = f"INDEX  ·  ★ {len([i for i in self.items[:-1] if i.name in self.favs])}"
+        e2 = ctx.text_extents(lab)
+        ctx.set_source_rgba(*ACCENT, 0.9 * a)
+        ctx.move_to(W - 48 - e2.x_advance, 56)
+        ctx.show_text(lab)
+
+        # search box
+        if self.search is not None:
+            q = self.search + ("▌" if int(now * 2.5) % 2 == 0 else " ")
+            ctx.set_font_size(18)
+            text = f"SEARCH › {q}"
+            e = ctx.text_extents(text)
+            bw = max(360, e.x_advance + 40)
+            rrect(ctx, W / 2 - bw / 2, 52, bw, 44, 10)
+            ctx.set_source_rgba(0.03, 0.05, 0.09, 0.85 * a)
+            ctx.fill_preserve()
+            ctx.set_source_rgba(*ACCENT, 0.9 * a)
+            ctx.set_line_width(1.5)
+            ctx.stroke()
+            ctx.move_to(W / 2 - bw / 2 + 20, 80)
+            ctx.show_text(text)
+
+        total = len(self.items)
+        pw = 18
+        start = W / 2 - total * (pw + 6) / 2
+        py = H / 2 + CARD_H / 2 + 70
+        for i in range(total):
+            on = i == self.sel
+            ctx.rectangle(start + i * (pw + 6), py, pw, 4 if on else 3)
+            it = self.items[i]
+            if on:
+                ctx.set_source_rgba(*ACCENT, a)
+            elif it is not IMPORT and it.name in self.favs:
+                ctx.set_source_rgba(1, 0.82, 0.3, 0.6 * a)
+            else:
+                ctx.set_source_rgba(1, 1, 1, 0.18 * a)
+            ctx.fill()
+
+        item = self.items[self.sel]
+        ctx.set_font_size(12)
+        if item is IMPORT:
+            info = "LOAD IMAGE OR VIDEO FROM DISK"
+        else:
+            res = self.entry(item)[2].get("res", "")
+            info = "  ·  ".join(x for x in (item.name, res, "VIDEO" if is_video(item) else "") if x)
+        ctx.set_source_rgba(0.85, 0.9, 1, 0.75 * a)
+        self.center_text(ctx, info, W / 2, py + 30)
+
+        msg_t, msg_at = self.toast
+        if self.confirm_del is not None:
+            msg = f"⚠  PRESS DEL AGAIN TO HIDE {self.items[self.confirm_del].name.upper()}  ·  ESC TO CANCEL"
+            ctx.set_source_rgba(1, 0.4, 0.45, (0.7 + 0.3 * math.sin(now * 8)) * a)
+        elif msg_t and now - msg_at < 2.2:
+            msg = msg_t
+            ctx.set_source_rgba(*ACCENT, min(1, 2.2 - (now - msg_at)) * a)
+        elif self.search is not None:
+            msg = "TYPE TO FILTER    ENTER CONFIRM    ESC CLEAR"
+            ctx.set_source_rgba(1, 1, 1, 0.4 * a)
+        else:
+            msg = "←/→ NAV   ENTER APPLY   / SEARCH   F FAV   R RANDOM   T ROTATE   O IMPORT   DEL HIDE   ESC EXIT"
+            ctx.set_source_rgba(1, 1, 1, 0.4 * a)
+        ctx.set_font_size(11)
+        self.center_text(ctx, msg, W / 2, H - 44)
+
+    def say(self, text):
+        self.toast = (text, time.monotonic() - self.t0)
+
+    # ---------- actions ----------
+    def activate(self):
+        item = self.items[self.sel]
+        if item is IMPORT:
+            self.choose_file()
+        else:
+            self.apply(item)
+
+    def apply(self, path):
+        self.applied = True
+        if is_video(path):
+            frame = self.entry(path)[2].get("frame")
+            if not shutil.which("mpvpaper"):
+                subprocess.Popen(["notify-send", "Wallpaper", "Video wallpapers need mpvpaper:\nyay -S mpvpaper"])
+                self.applied = False
+                self.say("✕ VIDEO WALLPAPERS NEED MPVPAPER  ·  yay -S mpvpaper")
+                return
+            script = (f"{THEME_CMD} {shlex.quote(frame)}; pkill -x swaybg; "
+                      f"echo {shlex.quote(str(path))} > {shlex.quote(str(ACTIVE_VIDEO))}; "
+                      f"pkill -x mpvpaper; setsid {mpv_cmd(path)} >/dev/null 2>&1 &")
+        else:
+            script = (f"pkill -x mpvpaper; rm -f {shlex.quote(str(ACTIVE_VIDEO))}; "
+                      f"{THEME_CMD} {shlex.quote(str(path))}")
+        self.win.close()
+        subprocess.Popen(["setsid", "sh", "-c", script])
+
+    def remove(self):
+        item = self.items[self.sel]
+        if item is IMPORT:
+            return
+        if self.confirm_del != self.sel:
+            self.confirm_del = self.sel
+            return
+        self.confirm_del = None
+        hide(item)
+        self.cache.pop(item, None)
+        self.favs.discard(item.name)
+        save_favs(self.favs)
+        nxt = self.sel
+        self.load_items()
+        self.sel = min(nxt, len(self.items) - 1)
+        self.pos = self.anim_from = float(self.sel)
+        self.say("◌ HIDDEN FROM PICKER (FILE KEPT ON DISK)")
+
+    def toggle_fav(self):
+        item = self.items[self.sel]
+        if item is IMPORT:
+            return
+        if item.name in self.favs:
+            self.favs.discard(item.name)
+            self.say("☆ UNFAVOURITED")
+        else:
+            self.favs.add(item.name)
+            self.say("★ FAVOURITED")
+        save_favs(self.favs)
+        self.load_items(keep=item)
+        self.pos = self.anim_from = float(self.sel)
+
+    def spin(self):
+        n = len(self.items) - 1
+        if n < 2:
+            return
+        choices = [i for i in range(n) if i != self.sel]
+        self.go(random.choice(choices), dur=1.1, fn=ease_spin)
+        self.say("⟳ RANDOM")
+
+    def toggle_rotate(self):
+        if not shutil.which(ROTATE_CMD):
+            self.say("✕ omarchy-hilm-rotate NOT FOUND")
+            return
+        subprocess.run([ROTATE_CMD, "off" if self.rotate.startswith("on") else "on"],
+                       capture_output=True, timeout=10)
+        self.rotate = rotate_status()
+        self.say(f"AUTO-ROTATE {self.rotate.upper()}")
+
+    def search_update(self):
+        q = (self.search or "").lower()
+        if not q:
+            return
+        for i, it in enumerate(self.items[:-1]):
+            if q in it.name.lower():
+                self.go(i, dur=0.25)
+                return
+
+    def choose_file(self):
+        self.win.hide()
+        dialog = Gtk.FileChooserDialog(title="Import wallpaper", action=Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                           Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        f = Gtk.FileFilter()
+        f.set_name("Images & videos")
+        for ext in IMAGE_EXT | VIDEO_EXT:
+            f.add_pattern("*" + ext)
+            f.add_pattern("*" + ext.upper())
+        dialog.add_filter(f)
+        dialog.set_current_folder(str(HOME))
+        resp = dialog.run()
+        chosen = Path(dialog.get_filename()) if resp == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if chosen is None:
+            self.win.show_all()
+            return
+        target = chosen
+        try:
+            POOL.mkdir(parents=True, exist_ok=True)
+            if POOL in chosen.resolve().parents:
+                target = chosen
+            else:
+                dest = POOL / chosen.name
+                n = 1
+                while dest.exists() and not dest.samefile(chosen):
+                    dest = POOL / f"{chosen.stem}-{n}{chosen.suffix}"
+                    n += 1
+                if not dest.exists():
+                    shutil.copy2(chosen, dest)
+                target = dest
+        except OSError:
+            pass
+        self.apply(target)
+
+    # ---------- input ----------
+    def on_key(self, _w, ev):
+        if time.monotonic() - self.t0 < 0.3:
+            return True
+        k = ev.keyval
+
+        if self.search is not None:
+            if k == Gdk.KEY_Escape:
+                self.search = None
+            elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self.search = None
+            elif k == Gdk.KEY_BackSpace:
+                self.search = self.search[:-1]
+                self.search_update()
+            elif k in (Gdk.KEY_Left, Gdk.KEY_Right):
+                self.go(self.sel + (1 if k == Gdk.KEY_Right else -1))
+            else:
+                ch = chr(Gdk.keyval_to_unicode(k)) if Gdk.keyval_to_unicode(k) else ""
+                if ch.isprintable() and ch:
+                    self.search += ch
+                    self.search_update()
+            return True
+
+        if k in (Gdk.KEY_Escape, Gdk.KEY_q):
+            if self.confirm_del is not None:
+                self.confirm_del = None
+            else:
+                self.win.close()
+        elif k in (Gdk.KEY_Left, Gdk.KEY_h, Gdk.KEY_a, Gdk.KEY_Up, Gdk.KEY_k):
+            self.go(self.sel - 1)
+        elif k in (Gdk.KEY_Right, Gdk.KEY_l, Gdk.KEY_d, Gdk.KEY_Down, Gdk.KEY_j, Gdk.KEY_Tab):
+            self.go(self.sel + 1)
+        elif k == Gdk.KEY_Home:
+            self.go(0)
+        elif k == Gdk.KEY_End:
+            self.go(len(self.items) - 1)
+        elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            self.activate()
+        elif k in (Gdk.KEY_Delete, Gdk.KEY_x):
+            self.remove()
+        elif k == Gdk.KEY_o:
+            self.choose_file()
+        elif k == Gdk.KEY_f:
+            self.toggle_fav()
+        elif k == Gdk.KEY_r:
+            self.spin()
+        elif k == Gdk.KEY_t:
+            self.toggle_rotate()
+        elif k == Gdk.KEY_slash:
+            self.search = ""
+        return True
+
+    def on_scroll(self, _w, ev):
+        if ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, dx, dy = ev.get_scroll_deltas()
+            step = dy if abs(dy) >= abs(dx) else dx
+            if abs(step) < 0.3:
+                return True
+            self.go(self.sel + (1 if step > 0 else -1))
+        elif ev.direction in (Gdk.ScrollDirection.DOWN, Gdk.ScrollDirection.RIGHT):
+            self.go(self.sel + 1)
+        else:
+            self.go(self.sel - 1)
+        return True
+
+    def on_click(self, _w, ev):
+        if ev.button == 3:
+            self.win.close()
+            return True
+        for i, x, y, w, h in reversed(self.hits):
+            if x <= ev.x <= x + w and y <= ev.y <= y + h:
+                if i == self.sel:
+                    self.activate()
+                else:
+                    self.go(i)
+                return True
+        self.win.close()
+        return True
+
+
+def mpv_cmd(path):
+    return ("mpvpaper -o " + shlex.quote("no-audio --loop-file=inf --panscan=1.0 --hwdec=auto")
+            + " '*' " + shlex.quote(str(path)))
+
+
+def launch_video(path):
+    subprocess.Popen(["setsid", "sh", "-c", f"{mpv_cmd(path)} >/dev/null 2>&1 &"])
+
+
+def main():
+    import sys
+    if "--version" in sys.argv:
+        print(f"omarchy-hilm {VERSION}")
+        return
+    Picker()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
