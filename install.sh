@@ -11,7 +11,7 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 REPO="https://github.com/Dagmawi-M/omarchy-hilm"
 BIN="$HOME/.local/bin"
 SHARE="$HOME/.local/share/omarchy-hilm"
@@ -144,7 +144,7 @@ ask_yes() {  # ask_yes <question>  (default yes)
 
 count_images() {
   # skip hidden entries *inside* the folder (the folder itself may live under ~/.config)
-  find "$1" -mindepth 1 -maxdepth 3 -name '.*' -prune -o -type f \( -iname '*.png' -o -iname '*.jpg' \
+  find -L "$1" -mindepth 1 -maxdepth 3 -name '.*' -prune -o -type f \( -iname '*.png' -o -iname '*.jpg' \
     -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.bmp' -o -iname '*.gif' -o -iname '*.mp4' \
     -o -iname '*.webm' \) -print 2>/dev/null | wc -l
 }
