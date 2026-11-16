@@ -1,0 +1,31 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n install.sh uninstall.sh bin/omarchy-hilm-rotate
+
+      - name: Python syntax
+        run: python3 -m py_compile bin/omarchy-hilm bin/omarchy-hilm-theme
+
+      - name: Version numbers match
+        run: |
+          a=$(grep -oP '^VERSION = "\K[^"]+' bin/omarchy-hilm)
+          b=$(grep -oP '^VERSION="\K[^"]+' install.sh)
+          echo "picker=$a installer=$b"
+          test "$a" = "$b"
+
+      - name: ShellCheck (errors only)
+        run: shellcheck -S error install.sh uninstall.sh bin/omarchy-hilm-rotate

@@ -1,6 +1,7 @@
 # omarchy-hilm
 
 [![Release](https://img.shields.io/github/v/release/Dagmawi-M/omarchy-hilm?style=flat-square)](https://github.com/Dagmawi-M/omarchy-hilm/releases/latest)
+[![check](https://github.com/Dagmawi-M/omarchy-hilm/actions/workflows/check.yml/badge.svg)](https://github.com/Dagmawi-M/omarchy-hilm/actions/workflows/check.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 ![Omarchy 3 & 4](https://img.shields.io/badge/omarchy-3.x%20%7C%204.x-orange?style=flat-square)
 
@@ -139,6 +140,10 @@ This removes the scripts, the shortcut, the thumbnail cache and the auto-rotate 
 ## How it was made
 
 hilm was designed, directed and tested by me, with the code written using [Claude Code](https://claude.com/claude-code) (Anthropic) as an AI coding assistant.
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately as described in [SECURITY.md](SECURITY.md).
 
 ## Changelog
 
