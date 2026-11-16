@@ -11,7 +11,7 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 REPO="https://github.com/Dagmawi-M/omarchy-hilm"
 BIN="$HOME/.local/bin"
 SHARE="$HOME/.local/share/omarchy-hilm"
@@ -32,7 +32,7 @@ else
   OMARCHY4=0; STATE="$HOME/.config/omarchy/current"
 fi
 DEPS=(python python-gobject python-cairo gtk3 gtk-layer-shell imagemagick ffmpegthumbnailer libnotify)
-((OMARCHY4)) || DEPS+=(swaybg)
+((OMARCHY4)) || DEPS+=(swaybg awww)   # awww: animated transitions on Omarchy 3 (v4 animates natively)
 LOG="$(mktemp -t omarchy-hilm-install.XXXXXX.log)"
 
 YES=0 KEYBIND=1 DIR_ARG=""

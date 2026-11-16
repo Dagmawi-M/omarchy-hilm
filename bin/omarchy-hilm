@@ -8,6 +8,7 @@ Shows your own collection plus every Omarchy theme's backgrounds.
 
 Keys:  ←/→ h/l, scroll   navigate        Enter/Space  apply
        Tab / Shift+Tab   switch source (all · collection · theme · all themes · web)
+       v                 cycle wallpaper transition (saved)
        u                 undo last change    w   search wallhaven.cc (SFW) and download
 CLI:   omarchy-hilm undo
        /  then type      search          f            favourite
@@ -68,6 +69,22 @@ IMPORT_DIR = POOL or HOME / ".config/omarchy/wallpapers"   # where imported file
 INCLUDE_THEMES = read_conf("INCLUDE_THEMES", "1") != "0"
 
 
+def write_conf(key, value):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = CONF_FILE.read_text().splitlines()
+    except OSError:
+        lines = ["# omarchy-hilm settings"]
+    new = f'{key}="{value}"'
+    for i, l in enumerate(lines):
+        if re.match(rf"^{key}=", l):
+            lines[i] = new
+            break
+    else:
+        lines.append(new)
+    CONF_FILE.write_text("\n".join(lines) + "\n")
+
+
 def _omarchy_path():
     for c in (os.environ.get("OMARCHY_PATH"), HOME / ".local/share/omarchy", "/usr/share/omarchy"):
         if c and Path(c).is_dir():
@@ -98,7 +115,7 @@ RADIUS = 14
 SPACING = 300
 FONT = "JetBrainsMono Nerd Font"
 IMPORT = object()
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 
 # ---------------------------------------------------------------- helpers
@@ -444,15 +461,73 @@ def ease_spin(t):
     return 1 - (1 - t) ** 5
 
 
+# ---------------------------------------------------------------- transitions
+# "default" = whatever Omarchy itself does (v4: its animated fade; v3: swaybg's
+# instant switch). On Omarchy 3 the other styles come from awww, which hilm runs
+# only while it is changing the wallpaper and then hands back to swaybg.
+AWWW_STYLES = ["fade", "wipe", "grow", "outer", "wave", "center",
+               "left", "right", "top", "bottom", "random"]
+TRANSITIONS = ["default", "none"] if OMARCHY4 else ["default"] + AWWW_STYLES
+TRANSITION = {"name": read_conf("TRANSITION", "default")}
+if TRANSITION["name"] not in TRANSITIONS:
+    TRANSITION["name"] = "default"
+BROWSE_SECS, APPLY_SECS = 0.7, 1.2
+
+
+def awww_available():
+    return bool(shutil.which("awww") and shutil.which("awww-daemon"))
+
+
+def using_awww():
+    return not OMARCHY4 and TRANSITION["name"] in AWWW_STYLES and awww_available()
+
+
+def awww_args(image, secs):
+    t = TRANSITION["name"]
+    return ["awww", "img", str(image), "--transition-type", t,
+            "--transition-duration", str(secs), "--transition-fps", "60"]
+
+
+def ensure_awww():
+    """Start awww showing the current wallpaper (no visible change), then retire swaybg."""
+    if subprocess.run(["awww", "query"], capture_output=True).returncode == 0:
+        return True
+    subprocess.Popen(["setsid", "awww-daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        time.sleep(0.05)
+        if subprocess.run(["awww", "query"], capture_output=True).returncode == 0:
+            break
+    else:
+        return False
+    cur = current_path()
+    if cur:
+        subprocess.run(["awww", "img", cur, "--transition-type", "none"], capture_output=True)
+    time.sleep(0.15)
+    subprocess.run(["pkill", "-x", "swaybg"])
+    return True
+
+
+def handback_script(image):
+    """Shell snippet: after the animation, give the background back to swaybg."""
+    q = shlex.quote(str(image))
+    return (f"sleep {APPLY_SECS + 0.2}; setsid swaybg -i {q} -m fill >/dev/null 2>&1 & "
+            f"sleep 0.4; pkill -x awww-daemon")
+
+
 def bg_launch(image):
     """Show `image` (or, on Omarchy 4, a video) as the desktop background."""
     if OMARCHY4:
         # live-only: does not touch the background symlink, so cancel can restore
+        call = "setInstant" if TRANSITION["name"] == "none" else "set"
         try:
-            subprocess.Popen(["omarchy-shell", "-q", "background", "set", str(image)],
+            subprocess.Popen(["omarchy-shell", "-q", "background", call, str(image)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
+        return
+    if using_awww() and not is_video(Path(image)) and ensure_awww():
+        subprocess.Popen(awww_args(image, BROWSE_SECS), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
         return
     # Omarchy 3: swap swaybg without a black gap: start new, then kill old
     old = subprocess.run(["pgrep", "-x", "swaybg"], capture_output=True, text=True).stdout.split()
@@ -672,6 +747,9 @@ class Picker:
             return
         if OMARCHY4:
             bg_launch(self.orig_bg or CURRENT)
+        elif using_awww() and not self.orig_video and self.orig_bg:
+            cmd = " ".join(shlex.quote(a) for a in awww_args(self.orig_bg, APPLY_SECS))
+            subprocess.Popen(["setsid", "sh", "-c", f"{cmd}; {handback_script(CURRENT)}"])
         elif self.orig_video:
             subprocess.run(["pkill", "-x", "swaybg"])
             launch_video(self.orig_video)
@@ -965,6 +1043,9 @@ class Picker:
         ctx.set_source_rgba(*(ACCENT if on else (1, 1, 1)), (0.9 if on else 0.35) * a)
         ctx.move_to(48, 126)
         ctx.show_text(f"AUTO-ROTATE: {self.rotate.upper()}")
+        ctx.move_to(48, 144)
+        ctx.set_source_rgba(1, 1, 1, 0.35 * a)
+        ctx.show_text(f"TRANSITION: {self.transition_label()}  (V)")
 
         if int(now * 2) % 2 == 0:
             ctx.set_source_rgba(*ACCENT, a)
@@ -1085,7 +1166,7 @@ class Picker:
                    else "TYPE TO FILTER    ENTER CONFIRM    ESC CLEAR")
             ctx.set_source_rgba(1, 1, 1, 0.4 * a)
         else:
-            msg = "←/→ NAV   TAB SOURCE   ENTER APPLY   U UNDO   / SEARCH   W WEB   F FAV   R RANDOM   T ROTATE   O IMPORT   DEL HIDE   ESC"
+            msg = "←/→ NAV   TAB SOURCE   ENTER APPLY   U UNDO   / SEARCH   W WEB   F FAV   R RANDOM   V TRANSITION   T ROTATE   O IMPORT   DEL HIDE   ESC"
             ctx.set_source_rgba(1, 1, 1, 0.4 * a)
         ctx.set_font_size(11)
         self.center_text(ctx, msg, W / 2, H - 44)
@@ -1124,6 +1205,11 @@ class Picker:
             script = (f"{THEME_CMD} {shlex.quote(frame)}; pkill -x swaybg; "
                       f"echo {shlex.quote(str(path))} > {shlex.quote(str(ACTIVE_VIDEO))}; "
                       f"pkill -x mpvpaper; setsid {mpv_cmd(path)} >/dev/null 2>&1 &")
+        elif using_awww() and not self.orig_video and ensure_awww():
+            anim = " ".join(shlex.quote(a) for a in awww_args(path, APPLY_SECS))
+            script = (f"pkill -x mpvpaper; rm -f {shlex.quote(str(ACTIVE_VIDEO))}; "
+                      f"{anim}; sleep {APPLY_SECS}; {THEME_CMD} {shlex.quote(str(path))}; "
+                      f"sleep 0.6; pkill -x awww-daemon")
         else:
             script = (f"pkill -x mpvpaper; rm -f {shlex.quote(str(ACTIVE_VIDEO))}; "
                       f"{THEME_CMD} {shlex.quote(str(path))}")
@@ -1237,6 +1323,25 @@ class Picker:
         self.go(random.choice(choices), dur=1.1, fn=ease_spin)
         self.say("\uf021 RANDOM")
 
+    def cycle_transition(self):
+        names = TRANSITIONS
+        nxt = names[(names.index(TRANSITION["name"]) + 1) % len(names)]
+        if not OMARCHY4 and nxt in AWWW_STYLES and not awww_available():
+            self.say("ANIMATED TRANSITIONS NEED awww  ·  sudo pacman -S awww")
+            return
+        TRANSITION["name"] = nxt
+        write_conf("TRANSITION", nxt)
+        self.say(f"TRANSITION: {self.transition_label()}")
+        self.previewing = None if self.previewing is None else ""   # re-preview with the new style
+        if self.items[self.sel] is not IMPORT:
+            self.do_preview()
+
+    def transition_label(self):
+        t = TRANSITION["name"]
+        if t == "default":
+            return "OMARCHY DEFAULT" + ("" if OMARCHY4 else " (INSTANT)")
+        return t.upper()
+
     def toggle_rotate(self):
         if not shutil.which(ROTATE_CMD):
             self.say("\uf00d omarchy-hilm-rotate NOT FOUND")
@@ -1345,6 +1450,8 @@ class Picker:
             self.toggle_fav()
         elif k == Gdk.KEY_r:
             self.spin()
+        elif k == Gdk.KEY_v:
+            self.cycle_transition()
         elif k == Gdk.KEY_t:
             self.toggle_rotate()
         elif k == Gdk.KEY_slash:

@@ -89,6 +89,7 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 | `/` | Search by name or theme |
 | `w` | Search **Wallhaven** online. Enter downloads the image into your collection and applies it |
 | `u` | **Undo**: restore the previous wallpaper *and* theme |
+| `v` | Cycle the **wallpaper transition** (saved) |
 | `f` | Favourite (★ favourites sort first) |
 | `r` | Random spin |
 | `t` | Turn auto-rotate on or off |
@@ -99,6 +100,10 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 ## Extras
 
 - **Undo:** each change remembers what you had before (the last 20). Press `u` in the picker, or run `omarchy-hilm undo`, to step back. It restores the exact theme too, whether that was a built-in Omarchy theme or a generated one.
+- **Transitions:** press `v` to choose how the wallpaper changes, both while you browse and when you apply. Your choice is saved.
+  - **Omarchy 4:** *Default* (Omarchy's own animated fade) or *None*.
+  - **Omarchy 3:** *Default* (Omarchy's instant switch) or an animation: fade, wipe, grow, outer, wave, center, left, right, top, bottom, random.
+  - On Omarchy 3, animations use [awww](https://github.com/LGFae/awww), which the installer adds. It runs only while hilm is changing the wallpaper, then hands the background back to Omarchy's `swaybg`, so nothing else in Omarchy changes. You can also set `TRANSITION="fade"` in `~/.config/omarchy-hilm/config`.
 - **Online wallpapers:** press `w`, type something ("neon city", "mountains"…) and press Enter. Results from [wallhaven.cc](https://wallhaven.cc) appear as a **WEB** source. Only safe-for-work results are requested. No account or API key is needed, and only your search words are sent. Downloads go into your collection folder, or `~/.config/omarchy/wallpapers` if you don't have one, and never overwrite existing files.
 
 - **Video and GIF wallpapers:** these work out of the box on Omarchy 4. On Omarchy 3, install `mpvpaper` first with `yay -S mpvpaper`. Then import or drop `.mp4`, `.webm`, `.mkv`, `.mov` or `.gif` files into your wallpaper folder.
