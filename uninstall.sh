@@ -22,6 +22,12 @@ for CONF in "$HOME/.config/hypr/bindings.conf" "$HOME/.config/hypr/hyprland.conf
   rm -f "$CONF.bak-omarchy-hilm"
   printf "  ${G}✔${N} Shortcut removed (Omarchy's default is back)\n"
 done
+LUA="$HOME/.config/hypr/bindings.lua"
+if [[ -f $LUA ]] && grep -q '^-- omarchy-hilm' "$LUA"; then
+  sed -i '/^-- omarchy-hilm$/,+1d' "$LUA"
+  rm -f "$LUA.bak-omarchy-hilm"
+  printf "  ${G}✔${N} Shortcut removed (Omarchy's default is back)\n"
+fi
 command -v hyprctl &>/dev/null && hyprctl reload &>/dev/null || true
 
 printf "\n  ${D}Kept: your wallpaper folder, favourites and settings (~/.config/omarchy-hilm).${N}\n"

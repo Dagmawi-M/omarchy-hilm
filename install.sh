@@ -11,7 +11,7 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 REPO="https://github.com/Dagmawi-M/omarchy-hilm"
 BIN="$HOME/.local/bin"
 SHARE="$HOME/.local/share/omarchy-hilm"
@@ -19,7 +19,20 @@ CONF_DIR="$HOME/.config/omarchy-hilm"
 OMARCHY_POOL="$HOME/.config/omarchy/wallpapers"
 MARK="# omarchy-hilm"
 SCRIPTS=(omarchy-hilm omarchy-hilm-theme omarchy-hilm-rotate)
-DEPS=(python python-gobject python-cairo gtk3 gtk-layer-shell imagemagick swaybg ffmpegthumbnailer libnotify)
+# ── which Omarchy? ───────────────────────────────────────────────────────────
+# Omarchy 4 moved state to ~/.local/state, Hyprland config to Lua, and draws the
+# background with omarchy-shell (videos included). Omarchy 3 uses swaybg.
+OMARCHY_DIR=""
+for c in "${OMARCHY_PATH:-}" "$HOME/.local/share/omarchy" /usr/share/omarchy; do
+  [[ -n $c && -d $c ]] && { OMARCHY_DIR=$c; break; }
+done
+if [[ -d $HOME/.local/state/omarchy/current ]] && command -v omarchy-theme-bg-set >/dev/null; then
+  OMARCHY4=1; STATE="$HOME/.local/state/omarchy/current"
+else
+  OMARCHY4=0; STATE="$HOME/.config/omarchy/current"
+fi
+DEPS=(python python-gobject python-cairo gtk3 gtk-layer-shell imagemagick ffmpegthumbnailer libnotify)
+((OMARCHY4)) || DEPS+=(swaybg)
 LOG="$(mktemp -t omarchy-hilm-install.XXXXXX.log)"
 
 YES=0 KEYBIND=1 DIR_ARG=""
@@ -151,8 +164,8 @@ banner
 
 # ── 1. scan ──────────────────────────────────────────────────────────────────
 title "01" "SCANNING SYSTEM"
-OMARCHY_VER="$(cat "$HOME/.local/share/omarchy/version" 2>/dev/null || true)"
-if [[ -d $HOME/.config/omarchy ]]; then ok "Omarchy ${OMARCHY_VER:-detected}"
+OMARCHY_VER="$(cat "$OMARCHY_DIR/version" 2>/dev/null || true)"
+if [[ -d $HOME/.config/omarchy ]]; then ok "Omarchy ${OMARCHY_VER:-detected} $( ((OMARCHY4)) && echo '(4.x layout)' || echo '(3.x layout)')"
 else warn "Omarchy config not found. Continuing, but this is built for Omarchy."; fi
 if command -v omarchy-theme-set-templates >/dev/null; then
   FULL=1; ok "Theme engine supports auto re-theming"
@@ -161,8 +174,12 @@ else
 fi
 missing=(); for p in "${DEPS[@]}"; do pacman -Qi "$p" &>/dev/null || missing+=("$p"); done
 ((${#missing[@]})) && info "${#missing[@]} package(s) to install: ${missing[*]}" || ok "All dependencies present"
-command -v mpvpaper >/dev/null && ok "mpvpaper found: video wallpapers enabled" \
-                               || info "mpvpaper not installed (optional, for video wallpapers)"
+if ((OMARCHY4)); then
+  ok "Video wallpapers supported natively"
+else
+  command -v mpvpaper >/dev/null && ok "mpvpaper found: video wallpapers enabled" \
+                                 || info "mpvpaper not installed (optional, for video wallpapers)"
+fi
 [[ -f $BIN/omarchy-hilm ]] && info "Existing install found: will update in place"
 
 # ── 2. wallpaper folder ──────────────────────────────────────────────────────
@@ -225,7 +242,7 @@ title "03" "READY TO INSTALL"
 printf "  ${D}scripts   ${N} ~/.local/bin/{omarchy-hilm,-theme,-rotate}\n"
 printf "  ${D}wallpapers${N} %s\n" "${POOL/#$HOME/\~}"
 ((${#missing[@]})) && printf "  ${D}packages  ${N} %s\n" "${missing[*]}"
-((KEYBIND)) && printf "  ${D}shortcut  ${N} SUPER + CTRL + SPACE ${D}(replaces Omarchy's \"next background\")${N}\n"
+((KEYBIND)) && printf "  ${D}shortcut  ${N} SUPER + CTRL + SPACE ${D}(replaces Omarchy's default background shortcut)${N}\n"
 printf "  ${D}theme     ${N} %s\n" "$( ((FULL)) && echo "creates its own 'hilm' theme. Your themes are untouched" || echo "wallpaper only")"
 echo
 if ((KEYBIND)) && ! ((YES)); then
@@ -282,9 +299,9 @@ run "Saving settings" do_config; tick
 do_pool() {
   mkdir -p "$POOL"
   ((SEED)) || return 0
-  local theme; theme="$(cat "$HOME/.config/omarchy/current/theme.name" 2>/dev/null || true)"
-  for d in "$HOME/.config/omarchy/current/theme/backgrounds" "$HOME/.config/omarchy/backgrounds/$theme" \
-           "$HOME/.local/share/omarchy/themes/$theme/backgrounds"; do
+  local theme; theme="$(cat "$STATE/theme.name" 2>/dev/null || true)"
+  for d in "$STATE/theme/backgrounds" "$HOME/.config/omarchy/backgrounds/$theme" \
+           "$OMARCHY_DIR/themes/$theme/backgrounds"; do
     [[ -d $d ]] || continue
     for f in "$d"/*; do [[ -f $f ]] && cp -Ln "$f" "$POOL/" 2>/dev/null; done
   done
@@ -312,6 +329,24 @@ fi
 tick
 
 do_keybind() {
+  # drop blocks left by older hilm installs in the other config format
+  for f in "$HOME/.config/hypr/bindings.conf" "$HOME/.config/hypr/hyprland.conf"; do
+    [[ -f $f ]] && sed -i '/# omarchy-wallpaper-cards/,+2d' "$f"
+  done
+  # Omarchy 4: Lua config. o.rebind replaces Omarchy's "Background switcher" on this key.
+  local lua="$HOME/.config/hypr/bindings.lua"
+  if [[ -f $lua ]] || [[ -f $HOME/.config/hypr/hyprland.lua ]]; then
+    touch "$lua"
+    for f in "$HOME/.config/hypr/bindings.conf" "$HOME/.config/hypr/hyprland.conf"; do
+      [[ -f $f ]] && sed -i "/^$MARK\$/,+2d" "$f"        # stale 3.x-style block
+    done
+    grep -q "^-- omarchy-hilm" "$lua" && return 0
+    cp "$lua" "$lua.bak-omarchy-hilm"
+    printf '\n-- omarchy-hilm\no.rebind("SUPER + CTRL + SPACE", "Hilm wallpaper picker", "%s")\n' \
+      "$BIN/omarchy-hilm" >>"$lua"
+    command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1 || true
+    return 0
+  fi
   local conf="$HOME/.config/hypr/bindings.conf"
   [[ -f $conf ]] || conf="$HOME/.config/hypr/hyprland.conf"
   [[ -f $conf ]] || return 0
@@ -348,5 +383,5 @@ else
   printf "  Wallpapers:  %s\n" "${POOL/#$HOME/\~}"
   printf "  Uninstall:   ~/.local/share/omarchy-hilm/uninstall.sh\n"
 fi
-command -v mpvpaper >/dev/null || printf "\n  ${D}Tip: 'yay -S mpvpaper' enables video/GIF wallpapers.${N}\n"
+((OMARCHY4)) || command -v mpvpaper >/dev/null || printf "\n  ${D}Tip: 'yay -S mpvpaper' enables video/GIF wallpapers.${N}\n"
 echo

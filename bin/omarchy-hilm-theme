@@ -81,6 +81,7 @@ def build(image):
     accent = hls_hex(accent_h, 0.55 if dark else 0.42, accent_s)
 
     c = {
+        "mode": "dark" if dark else "light",
         "accent": accent,
         "active_border_color": hls_hex(accent_h, 0.68 if dark else 0.50, accent_s * 0.8),
         "active_tab_background": accent,
@@ -102,10 +103,37 @@ def build(image):
         h = anchor + delta * TINT
         c[f"color{i}"] = hls_hex(h, 0.58 if dark else 0.40, 0.55)
         c[f"color{i + 8}"] = hls_hex(h, 0.70 if dark else 0.52, 0.62)
+    # Omarchy 4 colour names (alongside the v3 ones; unused keys are harmless)
+    c.update({
+        "selection": c["selection_background"],
+        "muted": c["color8"],
+        "dark_background": hls_hex(accent_h, bg_l - 0.03 if dark else bg_l - 0.04, 0.10),
+        "darker_background": hls_hex(accent_h, bg_l - 0.05 if dark else bg_l - 0.08, 0.10),
+        "lighter_background": hls_hex(accent_h, bg_l + 0.06 if dark else bg_l + 0.03, 0.10),
+        "dark_foreground": c["color7"],
+        "light_foreground": hls_hex(accent_h, 0.90 if dark else 0.30, 0.05),
+        "bright_foreground": c["color15"],
+        "red": c["color1"], "green": c["color2"], "yellow": c["color3"], "blue": c["color4"],
+        "magenta": c["color5"], "cyan": c["color6"],
+        "bright_red": c["color9"], "bright_green": c["color10"], "bright_yellow": c["color11"],
+        "bright_blue": c["color12"], "bright_magenta": c["color13"], "bright_cyan": c["color14"],
+        "orange": hls_hex(0.08 + (((accent_h - 0.08 + 0.5) % 1) - 0.5) * TINT, 0.58 if dark else 0.42, 0.65),
+        "brown": hls_hex(0.07, 0.40 if dark else 0.35, 0.40),
+    })
     return c, dark
 
 
-OMARCHY_PATH = Path(os.environ.get("OMARCHY_PATH") or HOME / ".local/share/omarchy")
+def _omarchy_path():
+    for c in (os.environ.get("OMARCHY_PATH"), HOME / ".local/share/omarchy", "/usr/share/omarchy"):
+        if c and Path(c).is_dir():
+            return Path(c)
+    return HOME / ".local/share/omarchy"
+
+
+OMARCHY_PATH = _omarchy_path()
+STATE_V4 = HOME / ".local/state/omarchy/current"
+OMARCHY4 = STATE_V4.is_dir() and shutil.which("omarchy-theme-bg-set") is not None
+CURRENT_LINK = (STATE_V4 if OMARCHY4 else HOME / ".config/omarchy/current") / "background"
 # Files Omarchy reads from a theme that are NOT generated from colors.toml.
 # Borrowed from a built-in theme of the same light/dark mode so nothing dangles
 # (e.g. Omarchy's nvim config symlinks current/theme/neovim.lua).
@@ -131,6 +159,8 @@ def donor_theme(dark):
 def fill_unknown_keys(colors):
     """Future-proofing: if this Omarchy's templates use a colour key we don't
     generate, derive it so no template is left with a raw {{ placeholder }}."""
+    if shutil.which("omarchy-theme-color"):
+        return {}   # Omarchy 4+ derives aliases/shades (purple, theme_type, …) itself
     keys = set()
     for d in (OMARCHY_PATH / "default/themed", HOME / ".config/omarchy/themed"):
         if d.is_dir():
@@ -180,6 +210,12 @@ def write_theme(colors, image, dark):
     lines.append("")
     for i in range(16):
         lines.append(f'color{i} = "{colors[f"color{i}"]}"')
+    lines += ["", "# Omarchy 4 names", f'mode = "{colors["mode"]}"']
+    for k in ("selection", "muted", "dark_background", "darker_background", "lighter_background",
+              "dark_foreground", "light_foreground", "bright_foreground", "red", "yellow", "orange",
+              "green", "cyan", "blue", "magenta", "brown", "bright_red", "bright_yellow",
+              "bright_green", "bright_cyan", "bright_blue", "bright_magenta"):
+        lines.append(f'{k} = "{colors[k]}"')
     extra = fill_unknown_keys(colors)
     if extra:
         lines.append("")
@@ -189,8 +225,11 @@ def write_theme(colors, image, dark):
     (THEME_DIR / "colors.toml").write_text("\n".join(lines) + "\n")
 
     donor = donor_theme(dark)
+    themed = OMARCHY_PATH / "default/themed"
     for f in DONOR_FILES:
         (THEME_DIR / f).unlink(missing_ok=True)
+        if (themed / f"{f}.tpl").exists():
+            continue     # this Omarchy generates it from our colours; a copy would override that
         if donor and (donor / f).is_file():
             shutil.copy2(donor / f, THEME_DIR / f)
 
@@ -201,7 +240,10 @@ def write_theme(colors, image, dark):
 
 
 def set_wallpaper_only(image):
-    link = HOME / ".config/omarchy/current/background"
+    if shutil.which("omarchy-theme-bg-set"):
+        subprocess.run(["omarchy-theme-bg-set", str(image)], check=False)
+        return
+    link = CURRENT_LINK
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.is_symlink() or link.exists():
         link.unlink()
@@ -216,7 +258,7 @@ def main():
     if args:
         image = args[0]
     else:
-        image = os.path.realpath(HOME / ".config/omarchy/current/background")
+        image = os.path.realpath(CURRENT_LINK)
     if not os.path.isfile(image):
         raise SystemExit(f"no such image: {image}")
 
@@ -233,6 +275,9 @@ def main():
 
     if "--no-apply" not in sys.argv:
         subprocess.run(["omarchy-theme-set", THEME_NAME], check=False)
+        # Omarchy 4 may remember an older background for this theme; pin ours
+        if OMARCHY4:
+            subprocess.run(["omarchy-theme-bg-set", image], check=False)
 
 
 if __name__ == "__main__":

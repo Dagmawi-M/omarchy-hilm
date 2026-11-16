@@ -41,7 +41,8 @@ EOF
 
 pick() {
   local cur list=()
-  cur=$(realpath "$HOME/.config/omarchy/current/background" 2>/dev/null || true)
+  cur=$(realpath "$HOME/.local/state/omarchy/current/background" 2>/dev/null ||
+        realpath "$HOME/.config/omarchy/current/background" 2>/dev/null || true)
   if [[ -s $FAVS ]]; then
     while IFS= read -r f; do
       [[ -n $f ]] || continue

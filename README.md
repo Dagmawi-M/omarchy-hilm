@@ -16,6 +16,8 @@
 
 > *hilm* (ሕልም): Amharic for "dream".
 
+![omarchy-hilm picker](assets/screenshot.png)
+
 A futuristic cover-flow wallpaper picker for [Omarchy](https://omarchy.org).
 
 Your wallpapers show as holographic cards with a neon frame in your theme's accent colour. Moving between cards previews each one live on your real desktop. When you pick one, your **whole system is re-themed from its colours**: terminal, Waybar, borders, btop and the rest.
@@ -67,9 +69,12 @@ It doesn't touch system files, your other themes, or any other configs.
 
 ### Compatibility
 
+hilm detects your Omarchy version and adapts automatically. You don't need to configure anything.
+
 | Omarchy | What you get |
 |---|---|
-| Versions with `colors.toml` theme templates (3.x and newer) | Wallpaper plus a full system re-theme |
+| 4.x (Lua config, `omarchy-shell` background) | Full re-theme, shortcut set in `bindings.lua`, video wallpapers built in |
+| 3.x (`colors.toml` templates, `swaybg`) | Full re-theme, shortcut set in `bindings.conf`. Video wallpapers need `mpvpaper` |
 | Older | Wallpaper only. Run `omarchy-update` to get re-theming |
 
 Re-theming creates its own theme called `hilm`. Your existing themes are never modified, so you can switch back from the Omarchy theme menu (**SUPER + SHIFT + CTRL + SPACE**) at any time.
@@ -90,7 +95,7 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 
 ## Extras
 
-- **Video and GIF wallpapers:** install `mpvpaper` with `yay -S mpvpaper`, then import or drop `.mp4`, `.webm`, `.mkv`, `.mov` or `.gif` files into your wallpaper folder.
+- **Video and GIF wallpapers:** these work out of the box on Omarchy 4. On Omarchy 3, install `mpvpaper` first with `yay -S mpvpaper`. Then import or drop `.mp4`, `.webm`, `.mkv`, `.mov` or `.gif` files into your wallpaper folder.
 - **Auto-rotate:** `omarchy-hilm-rotate on|off|next|interval <minutes>`. It rotates through your favourites, or the whole pool if you have none. The default interval is 30 minutes.
 - **Adding wallpapers:** put images in your wallpaper folder (subfolders up to 2 levels deep are included), or use the Import card. Importing copies the file into your folder and never overwrites anything.
 - **Changing folders:** run the installer again, or edit `WALLPAPER_DIR` in `~/.config/omarchy-hilm/config`.
@@ -101,6 +106,7 @@ Re-theming creates its own theme called `hilm`. Your existing themes are never m
 | Problem | Fix |
 |---|---|
 | Package install fails | Run `sudo pacman -Syu` (or `omarchy-update`), then run the installer again |
+| Shortcut opens Omarchy's own background switcher | Run the installer again to update. Older hilm versions didn't support Omarchy 4's Lua config |
 | Shortcut does nothing | Run `hyprctl reload`, or run `omarchy-hilm` in a terminal to see errors |
 | Thumbnails look wrong after editing an image | Delete `~/.cache/omarchy-hilm` |
 | Want your old theme back | Use the Omarchy theme menu (**SUPER + SHIFT + CTRL + SPACE**) |

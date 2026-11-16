@@ -49,8 +49,13 @@ def read_pool():
 
 
 POOL = read_pool()
-CURRENT = HOME / ".config/omarchy/current/background"
-COLORS = HOME / ".config/omarchy/current/theme/colors.toml"
+# Omarchy 4 keeps state in ~/.local/state and draws the background with
+# omarchy-shell; Omarchy 3 uses ~/.config/omarchy/current and swaybg.
+STATE_V4 = HOME / ".local/state/omarchy/current"
+OMARCHY4 = STATE_V4.is_dir() and shutil.which("omarchy-theme-bg-set") is not None
+CUR_DIR = STATE_V4 if OMARCHY4 else HOME / ".config/omarchy/current"
+CURRENT = CUR_DIR / "background"
+COLORS = CUR_DIR / "theme/colors.toml"
 FAVS = CONF_DIR / "favorites"
 CACHE = HOME / ".cache/omarchy-hilm"
 ACTIVE_VIDEO = CACHE / "active-video"
@@ -65,7 +70,7 @@ RADIUS = 14
 SPACING = 300
 FONT = "JetBrainsMono Nerd Font"
 IMPORT = object()
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------- helpers
@@ -96,6 +101,9 @@ def current_path():
 
 
 def active_video():
+    if OMARCHY4:   # the shell plays videos itself; the background link says what's on
+        cur = current_path()
+        return cur if cur and is_video(Path(cur)) else None
     try:
         v = ACTIVE_VIDEO.read_text().strip()
         if v and subprocess.run(["pgrep", "-x", "mpvpaper"], capture_output=True).returncode == 0:
@@ -233,7 +241,16 @@ def ease_spin(t):
 
 
 def bg_launch(image):
-    """Swap swaybg to `image` without a black gap: start new, then kill old."""
+    """Show `image` (or, on Omarchy 4, a video) as the desktop background."""
+    if OMARCHY4:
+        # live-only: does not touch the background symlink, so cancel can restore
+        try:
+            subprocess.Popen(["omarchy-shell", "-q", "background", "set", str(image)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+        return
+    # Omarchy 3: swap swaybg without a black gap: start new, then kill old
     old = subprocess.run(["pgrep", "-x", "swaybg"], capture_output=True, text=True).stdout.split()
     subprocess.Popen(["setsid", "swaybg", "-i", str(image), "-m", "fill"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -285,6 +302,7 @@ class Picker:
         self.applied = False
         self.previewing = None
         self.orig_video = active_video()
+        self.orig_bg = current_path()
         self.rotate = rotate_status()
         self.t0 = time.monotonic()
         self.switch_t = -10.0
@@ -374,13 +392,13 @@ class Picker:
         if item is IMPORT or self.applied:
             return False
         target = item
-        if is_video(item):
+        if is_video(item) and not OMARCHY4:
             target = self.entry(item)[2].get("frame")
             if not target:
                 return False
         if self.previewing == str(target):
             return False
-        if self.previewing is None and self.orig_video:
+        if self.previewing is None and self.orig_video and not OMARCHY4:
             subprocess.run(["pkill", "-x", "mpvpaper"])
         self.previewing = str(target)
         bg_launch(target)
@@ -389,7 +407,9 @@ class Picker:
     def restore(self):
         if self.previewing is None:
             return
-        if self.orig_video:
+        if OMARCHY4:
+            bg_launch(self.orig_bg or CURRENT)
+        elif self.orig_video:
             subprocess.run(["pkill", "-x", "swaybg"])
             launch_video(self.orig_video)
         else:
@@ -407,9 +427,25 @@ class Picker:
         intro = ease(min(1.0, now / 0.45))
         self.hits = []
 
-        # translucent backdrop: real (previewed) wallpaper shows through
-        ctx.set_source_rgba(0.02, 0.03, 0.06, 0.42 * intro)
-        ctx.paint()
+        # translucent backdrop: real (previewed) wallpaper shows through.
+        # HILM_OPAQUE=1 paints a solid, heavily blurred backdrop instead
+        # (used for screenshots so nothing on the desktop is captured).
+        if os.environ.get("HILM_OPAQUE"):
+            ctx.set_source_rgb(0.02, 0.03, 0.06)
+            ctx.paint()
+            cur = self.items[self.sel]
+            blur = None if cur is IMPORT else self.entry(cur)[1]
+            if blur is not None:
+                tiny = blur.scale_simple(6, 4, GdkPixbuf.InterpType.BILINEAR)
+                ctx.save()
+                ctx.scale(W / 6, H / 4)
+                Gdk.cairo_set_source_pixbuf(ctx, tiny, 0, 0)
+                ctx.get_source().set_filter(cairo.FILTER_BILINEAR)
+                ctx.paint_with_alpha(0.35)
+                ctx.restore()
+        else:
+            ctx.set_source_rgba(0.02, 0.03, 0.06, 0.42 * intro)
+            ctx.paint()
 
         # perspective grid floor
         horizon = H * 0.5 + CARD_H * 0.5 + 40
@@ -587,12 +623,12 @@ class Picker:
             if self.is_active(item):
                 chip_x = self.draw_chip(ctx, chip_x, y + 14 * scale, "● ACTIVE", scale, alpha) - 6 * scale
             if is_video(item):
-                chip_x = self.draw_chip(ctx, chip_x, y + 14 * scale, "▶ LIVE", scale, alpha, ACCENT2) - 6 * scale
+                chip_x = self.draw_chip(ctx, chip_x, y + 14 * scale, "\uf04b LIVE", scale, alpha, ACCENT2) - 6 * scale
             if item.name in self.favs:
                 ctx.set_font_size(20 * scale)
                 ctx.set_source_rgba(1, 0.82, 0.3, alpha)
                 ctx.move_to(x + 14 * scale, y + 32 * scale)
-                ctx.show_text("★")
+                ctx.show_text("\uf005")
         ctx.restore()
 
         sx0 = cx + x_off - w * squash / 2
@@ -648,7 +684,7 @@ class Picker:
         ctx.set_font_size(12)
         ctx.set_source_rgba(*ACCENT, 0.9 * a)
         ctx.move_to(48, 56)
-        ctx.show_text("◢ HILM://WALLPAPER")
+        ctx.show_text("\u258c HILM://WALLPAPER")
         ctx.set_font_size(26)
         ctx.set_source_rgba(0.96, 0.97, 1, a)
         ctx.move_to(48, 90)
@@ -678,7 +714,7 @@ class Picker:
         ctx.move_to(W - 48 - e.x_advance, 90)
         ctx.show_text(idx)
         ctx.set_font_size(11)
-        lab = f"INDEX  ·  ★ {len([i for i in self.items[:-1] if i.name in self.favs])}"
+        lab = f"INDEX  ·  \uf005 {len([i for i in self.items[:-1] if i.name in self.favs])}"
         e2 = ctx.text_extents(lab)
         ctx.set_source_rgba(*ACCENT, 0.9 * a)
         ctx.move_to(W - 48 - e2.x_advance, 56)
@@ -728,7 +764,7 @@ class Picker:
 
         msg_t, msg_at = self.toast
         if self.confirm_del is not None:
-            msg = f"⚠  PRESS DEL AGAIN TO HIDE {self.items[self.confirm_del].name.upper()}  ·  ESC TO CANCEL"
+            msg = f"\uf071  PRESS DEL AGAIN TO HIDE {self.items[self.confirm_del].name.upper()}  ·  ESC TO CANCEL"
             ctx.set_source_rgba(1, 0.4, 0.45, (0.7 + 0.3 * math.sin(now * 8)) * a)
         elif msg_t and now - msg_at < 2.2:
             msg = msg_t
@@ -755,12 +791,19 @@ class Picker:
 
     def apply(self, path):
         self.applied = True
-        if is_video(path):
+        if is_video(path) and OMARCHY4:
+            # theme from a still frame, then let Omarchy's shell play the video
+            frame = self.entry(path)[2].get("frame") or ""
+            script = (f"{THEME_CMD} {shlex.quote(frame)}; "
+                      f"omarchy-theme-bg-set {shlex.quote(str(path))}")
+        elif OMARCHY4:
+            script = f"{THEME_CMD} {shlex.quote(str(path))}"
+        elif is_video(path):
             frame = self.entry(path)[2].get("frame")
             if not shutil.which("mpvpaper"):
                 subprocess.Popen(["notify-send", "Wallpaper", "Video wallpapers need mpvpaper:\nyay -S mpvpaper"])
                 self.applied = False
-                self.say("✕ VIDEO WALLPAPERS NEED MPVPAPER  ·  yay -S mpvpaper")
+                self.say("\uf00d VIDEO WALLPAPERS NEED MPVPAPER  ·  yay -S mpvpaper")
                 return
             script = (f"{THEME_CMD} {shlex.quote(frame)}; pkill -x swaybg; "
                       f"echo {shlex.quote(str(path))} > {shlex.quote(str(ACTIVE_VIDEO))}; "
@@ -787,7 +830,7 @@ class Picker:
         self.load_items()
         self.sel = min(nxt, len(self.items) - 1)
         self.pos = self.anim_from = float(self.sel)
-        self.say("◌ HIDDEN FROM PICKER (FILE KEPT ON DISK)")
+        self.say("\uf070 HIDDEN FROM PICKER (FILE KEPT ON DISK)")
 
     def toggle_fav(self):
         item = self.items[self.sel]
@@ -795,10 +838,10 @@ class Picker:
             return
         if item.name in self.favs:
             self.favs.discard(item.name)
-            self.say("☆ UNFAVOURITED")
+            self.say("\uf006 UNFAVOURITED")
         else:
             self.favs.add(item.name)
-            self.say("★ FAVOURITED")
+            self.say("\uf005 FAVOURITED")
         save_favs(self.favs)
         self.load_items(keep=item)
         self.pos = self.anim_from = float(self.sel)
@@ -809,11 +852,11 @@ class Picker:
             return
         choices = [i for i in range(n) if i != self.sel]
         self.go(random.choice(choices), dur=1.1, fn=ease_spin)
-        self.say("⟳ RANDOM")
+        self.say("\uf021 RANDOM")
 
     def toggle_rotate(self):
         if not shutil.which(ROTATE_CMD):
-            self.say("✕ omarchy-hilm-rotate NOT FOUND")
+            self.say("\uf00d omarchy-hilm-rotate NOT FOUND")
             return
         subprocess.run([ROTATE_CMD, "off" if self.rotate.startswith("on") else "on"],
                        capture_output=True, timeout=10)
