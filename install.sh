@@ -11,7 +11,7 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 REPO="https://github.com/Dagmawi-M/omarchy-hilm"
 BIN="$HOME/.local/bin"
 SHARE="$HOME/.local/share/omarchy-hilm"
@@ -310,7 +310,7 @@ do_pool() {
 run "Preparing wallpaper folder" do_pool; tick
 
 do_thumbs() {  # warm the thumbnail cache so the first launch is instant
-  PYTHONDONTWRITEBYTECODE=1 python3 - "$BIN/omarchy-hilm" <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 - "$BIN/omarchy-hilm" <<'PY'
 import sys, importlib.util
 from importlib.machinery import SourceFileLoader
 spec = importlib.util.spec_from_loader("hilm", SourceFileLoader("hilm", sys.argv[1]))
@@ -365,6 +365,14 @@ do_keybind() {
 }
 if ((KEYBIND)); then run "Adding SUPER + CTRL + SPACE shortcut" do_keybind; else info "Skipped shortcut"; fi
 tick
+
+# Verify the picker can actually start with the system Python. A python3 from
+# mise/pyenv/conda can't see pacman's python-gobject, so the scripts pin
+# /usr/bin/python3; this catches anything else missing.
+if ! /usr/bin/python3 -c 'import gi, cairo; gi.require_version("Gtk", "3.0"); gi.require_version("GtkLayerShell", "0.1"); from gi.repository import Gtk, GtkLayerShell' >>"$LOG" 2>&1; then
+  die "The picker's libraries don't load with /usr/bin/python3. Try: sudo pacman -S python-gobject python-cairo gtk-layer-shell"
+fi
+ok "Picker libraries load correctly"
 
 progress $STEP $TOTAL "complete"
 

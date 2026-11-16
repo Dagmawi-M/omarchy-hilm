@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Generate an omarchy theme from a wallpaper's colors.
 
 omarchy already renders every app's config from a theme's colors.toml, so all
